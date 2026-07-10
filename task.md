@@ -1,0 +1,27 @@
+# HNTR Protocol Implementation Tasks
+
+- `[x]` Phase 1: Core Architecture & Membership
+  - `[x]` Initialize Foundry project
+  - `[ ]` Implement `HNTRMembership.sol`
+    - `[ ]` Tier management and limits
+    - `[ ]` USDT/USDC purchasing logic
+    - `[ ]` User struct and upline mapping
+- `[ ]` Phase 2: Unilevel MLM & The 80/20 Split
+  - `[ ]` Implement `HNTRCommissions.sol`
+    - `[ ]` 12-level distribution iteration
+    - `[ ]` 80% stablecoin distribution
+    - `[ ]` 20% Uniswap V4 swap to ETH
+- `[ ]` Phase 3: NFT Strategy Pools with OpenSea
+  - `[ ]` Implement `HNTRPoolManager.sol`
+  - `[ ]` Implement `HNTRPool.sol`
+    - `[ ]` ETH deposit tracking
+    - `[ ]` Seaport purchase execution
+    - `[ ]` Seaport listing execution
+- `[ ]` Phase 4: Treasury & Manual Distributions
+  - `[ ]` Implement `HNTRTreasury.sol`
+    - `[ ]` 25% revenue holding
+    - `[ ]` 10% bonus pool holding
+    - `[ ]` Admin payout functions
+- `[ ]` Phase 5: Testing & Deployment
+  - `[ ]` Unit tests
+  - `[ ]` Mainnet fork tests (Uniswap + Seaport)
