@@ -19,8 +19,8 @@ interface IHNTRMembership {
     function getUser(address user) external view returns (User memory);
     
     // The backend provides the `uplines` array for distribution.
-    function purchaseMembership(Tier tier, address[] calldata uplines, address token) external;
-    function upgradeMembership(Tier newTier, address[] calldata uplines, address token) external;
+    function purchaseMembership(address user, Tier tier, address[] calldata uplines, address token) external;
+    function upgradeMembership(address user, Tier newTier, address[] calldata uplines, address token) external;
     
-    function withdrawCommissions(address token) external;
+    function withdrawCommissions(address user, address token) external;
 }

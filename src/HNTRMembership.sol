@@ -14,6 +14,8 @@ contract HNTRMembership is IHNTRMembership {
     address public treasuryWallet;
     address public leadershipWallet;
     address public achievementWallet;
+    address public poolWallet;
+    address public burnerWallet;
     address public owner;
 
     mapping(address => User) public users;
@@ -33,10 +35,16 @@ contract HNTRMembership is IHNTRMembership {
     event MembershipUpgraded(address indexed user, Tier oldTier, Tier newTier, uint256 amountPaid, address token);
     event CommissionEarned(address indexed user, uint256 liquidAmount, uint256 lockedAmount, uint8 level, address token);
     event CommissionWithdrawn(address indexed user, uint256 amount, address token);
-    event WalletsUpdated(address treasury, address leadership, address achievement);
+    event WalletsUpdated(address treasury, address leadership, address achievement, address poolWallet);
+    event BurnerWalletUpdated(address burnerWallet);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    modifier onlyBurnerWallet() {
+        require(msg.sender == burnerWallet, "Not burner wallet");
         _;
     }
 
@@ -63,62 +71,71 @@ contract HNTRMembership is IHNTRMembership {
         tierMaxLevels[Tier.APEX] = 12;
     }
 
-    function setWallets(address _treasury, address _leadership, address _achievement) external onlyOwner {
+    function setWallets(address _treasury, address _leadership, address _achievement, address _poolWallet) external onlyOwner {
         treasuryWallet = _treasury;
         leadershipWallet = _leadership;
         achievementWallet = _achievement;
-        emit WalletsUpdated(_treasury, _leadership, _achievement);
+        poolWallet = _poolWallet;
+        emit WalletsUpdated(_treasury, _leadership, _achievement, _poolWallet);
+    }
+
+    function setBurnerWallet(address _burnerWallet) external onlyOwner {
+        burnerWallet = _burnerWallet;
+        emit BurnerWalletUpdated(_burnerWallet);
     }
 
     function getUser(address user) external view override returns (User memory) {
         return users[user];
     }
 
-    function purchaseMembership(Tier tier, address[] calldata uplines, address token) external override {
+    function purchaseMembership(address user, Tier tier, address[] calldata uplines, address token) external override onlyBurnerWallet {
         require(tier != Tier.NONE, "Invalid tier");
-        require(users[msg.sender].tier == Tier.NONE, "Already a member");
+        require(users[user].tier == Tier.NONE, "Already a member");
         require(token == usdt || token == usdc, "Unsupported token");
 
         uint256 price = tierPrices[tier];
         require(price > 0, "Tier price not set");
 
-        users[msg.sender] = User({
+        users[user] = User({
             tier: tier,
             joinedAt: block.timestamp
         });
 
-        _processPaymentAndDistribution(price, uplines, token);
+        _processPaymentAndDistribution(user, price, uplines, token);
 
-        emit MembershipPurchased(msg.sender, tier, price, token);
+        emit MembershipPurchased(user, tier, price, token);
     }
 
-    function upgradeMembership(Tier newTier, address[] calldata uplines, address token) external override {
-        User storage user = users[msg.sender];
-        require(user.tier != Tier.NONE, "Not a member");
-        require(uint8(newTier) > uint8(user.tier), "Can only upgrade to higher tier");
+    function upgradeMembership(address user, Tier newTier, address[] calldata uplines, address token) external override onlyBurnerWallet {
+        User storage u = users[user];
+        require(u.tier != Tier.NONE, "Not a member");
+        require(uint8(newTier) > uint8(u.tier), "Can only upgrade to higher tier");
         require(token == usdt || token == usdc, "Unsupported token");
 
-        uint256 priceDiff = tierPrices[newTier] - tierPrices[user.tier];
-        Tier oldTier = user.tier;
-        user.tier = newTier;
+        uint256 priceDiff = tierPrices[newTier] - tierPrices[u.tier];
+        Tier oldTier = u.tier;
+        u.tier = newTier;
 
-        _processPaymentAndDistribution(priceDiff, uplines, token);
+        _processPaymentAndDistribution(user, priceDiff, uplines, token);
 
-        emit MembershipUpgraded(msg.sender, oldTier, newTier, priceDiff, token);
+        emit MembershipUpgraded(user, oldTier, newTier, priceDiff, token);
     }
 
-    function _processPaymentAndDistribution(uint256 amount, address[] calldata uplines, address token) internal {
+    function _processPaymentAndDistribution(address user, uint256 amount, address[] calldata uplines, address token) internal {
         // Pull funds from user
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(token).safeTransferFrom(user, address(this), amount);
 
         {
-            // 1. Treasury (25%)
-            IERC20(token).safeTransfer(treasuryWallet, (amount * 25) / 100);
+            // 1. Treasury (5%)
+            IERC20(token).safeTransfer(treasuryWallet, (amount * 5) / 100);
 
-            // 2. Leadership Pool (5%)
+            // 2. Pool Wallet (20%)
+            IERC20(token).safeTransfer(poolWallet, (amount * 20) / 100);
+
+            // 3. Leadership Pool (5%)
             IERC20(token).safeTransfer(leadershipWallet, (amount * 5) / 100);
 
-            // 3. Achievement Bonus (5%)
+            // 4. Achievement Bonus (5%)
             IERC20(token).safeTransfer(achievementWallet, (amount * 5) / 100);
         }
 
@@ -157,15 +174,15 @@ contract HNTRMembership is IHNTRMembership {
         }
     }
 
-    function withdrawCommissions(address token) external override {
+    function withdrawCommissions(address user, address token) external override onlyBurnerWallet {
         require(token == usdt || token == usdc, "Unsupported token");
 
-        uint256 amount = withdrawableCommissions[msg.sender][token];
+        uint256 amount = withdrawableCommissions[user][token];
         require(amount > 0, "No commissions to withdraw");
 
-        withdrawableCommissions[msg.sender][token] = 0;
-        IERC20(token).safeTransfer(msg.sender, amount);
+        withdrawableCommissions[user][token] = 0;
+        IERC20(token).safeTransfer(user, amount);
 
-        emit CommissionWithdrawn(msg.sender, amount, token);
+        emit CommissionWithdrawn(user, amount, token);
     }
 }
