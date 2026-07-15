@@ -16,6 +16,8 @@ contract HNTRMembershipTest is Test {
     address treasuryWallet = address(2);
     address leadershipWallet = address(3);
     address achievementWallet = address(4);
+    address poolWallet = address(5);
+    address burner = address(6); // relayer wallet - only address allowed to call purchase/upgrade/withdraw
 
     address rootUser = address(10);
     address user1 = address(11); // Will be an Apex
@@ -32,7 +34,8 @@ contract HNTRMembershipTest is Test {
             address(usdt),
             address(usdc)
         );
-        membership.setWallets(treasuryWallet, leadershipWallet, achievementWallet);
+        membership.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
+        membership.setBurnerWallet(burner);
 
         // Mint and approve for all users
         address[4] memory users = [rootUser, user1, user2, user3];
@@ -50,21 +53,21 @@ contract HNTRMembershipTest is Test {
         vm.stopPrank();
 
         // 1. Root buys APEX ($2500)
-        vm.prank(rootUser);
-        membership.purchaseMembership(IHNTRMembership.Tier.APEX, new address[](0), address(usdt));
+        vm.prank(burner);
+        membership.purchaseMembership(rootUser, IHNTRMembership.Tier.APEX, new address[](0), address(usdt));
 
         // 2. User1 buys APEX ($2500), upline: root
         address[] memory uplines1 = new address[](1);
         uplines1[0] = rootUser;
-        vm.prank(user1);
-        membership.purchaseMembership(IHNTRMembership.Tier.APEX, uplines1, address(usdt));
+        vm.prank(burner);
+        membership.purchaseMembership(user1, IHNTRMembership.Tier.APEX, uplines1, address(usdt));
 
         // 3. User2 buys SCOUT ($50), upline: user1, root
         address[] memory uplines2 = new address[](2);
         uplines2[0] = user1;
         uplines2[1] = rootUser;
-        vm.prank(user2);
-        membership.purchaseMembership(IHNTRMembership.Tier.SCOUT, uplines2, address(usdt));
+        vm.prank(burner);
+        membership.purchaseMembership(user2, IHNTRMembership.Tier.SCOUT, uplines2, address(usdt));
     }
 
     function test_PurchaseDistribution() public {
@@ -83,8 +86,8 @@ contract HNTRMembershipTest is Test {
         uplines[1] = user1; // APEX
         uplines[2] = rootUser; // APEX
 
-        vm.prank(user3);
-        membership.purchaseMembership(IHNTRMembership.Tier.APEX, uplines, address(usdt));
+        vm.prank(burner);
+        membership.purchaseMembership(user3, IHNTRMembership.Tier.APEX, uplines, address(usdt));
 
         uint256 price = 2500 * 1e6;
 
@@ -129,19 +132,19 @@ contract HNTRMembershipTest is Test {
             usdt.approve(address(membership), type(uint256).max);
         }
 
-        vm.prank(apexLeader); membership.purchaseMembership(IHNTRMembership.Tier.APEX, new address[](0), address(usdt));
+        vm.prank(burner); membership.purchaseMembership(apexLeader, IHNTRMembership.Tier.APEX, new address[](0), address(usdt));
         
         address[] memory upD = new address[](1); upD[0] = apexLeader;
-        vm.prank(scoutD); membership.purchaseMembership(IHNTRMembership.Tier.SCOUT, upD, address(usdt));
+        vm.prank(burner); membership.purchaseMembership(scoutD, IHNTRMembership.Tier.SCOUT, upD, address(usdt));
 
         address[] memory upC = new address[](2); upC[0] = scoutD; upC[1] = apexLeader;
-        vm.prank(scoutC); membership.purchaseMembership(IHNTRMembership.Tier.SCOUT, upC, address(usdt));
+        vm.prank(burner); membership.purchaseMembership(scoutC, IHNTRMembership.Tier.SCOUT, upC, address(usdt));
 
         address[] memory upB = new address[](3); upB[0] = scoutC; upB[1] = scoutD; upB[2] = apexLeader;
-        vm.prank(scoutB); membership.purchaseMembership(IHNTRMembership.Tier.SCOUT, upB, address(usdt));
+        vm.prank(burner); membership.purchaseMembership(scoutB, IHNTRMembership.Tier.SCOUT, upB, address(usdt));
 
         address[] memory upA = new address[](4); upA[0] = scoutB; upA[1] = scoutC; upA[2] = scoutD; upA[3] = apexLeader;
-        vm.prank(scoutA); membership.purchaseMembership(IHNTRMembership.Tier.SCOUT, upA, address(usdt));
+        vm.prank(burner); membership.purchaseMembership(scoutA, IHNTRMembership.Tier.SCOUT, upA, address(usdt));
 
         uint256 apexLiquidBefore = membership.withdrawableCommissions(apexLeader, address(usdt));
 
@@ -154,8 +157,8 @@ contract HNTRMembershipTest is Test {
         buyerUps[3] = scoutD; // Tries for L4 (FAILS, max 3) => SKIPPED
         buyerUps[4] = apexLeader; // Tries for L4 (Qualifies, max 12) => Gets L4 (5%)
 
-        vm.prank(buyer);
-        membership.purchaseMembership(IHNTRMembership.Tier.APEX, buyerUps, address(usdt));
+        vm.prank(burner);
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.APEX, buyerUps, address(usdt));
 
         // ApexLeader gets L4 commission = 5% = $125
         // 80% liquid = $100
