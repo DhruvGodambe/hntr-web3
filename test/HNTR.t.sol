@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {HNTRMembership} from "../src/HNTRMembership.sol";
 import {IHNTRMembership} from "../src/IHNTRMembership.sol";
 import {MockERC20, MockFeeOnTransferERC20} from "./Mocks.sol";
 import {MessageHashUtils} from "openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
+import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+
+/// @dev 18-decimal token used only to assert constructor decimal guard.
+contract MockERC20_18 is ERC20 {
+    constructor() ERC20("Bad", "BAD") {}
+
+    function decimals() public pure override returns (uint8) {
+        return 18;
+    }
+}
 
 contract HNTRMembershipTest is Test {
     using MessageHashUtils for bytes32;
@@ -17,19 +27,24 @@ contract HNTRMembershipTest is Test {
     uint256 companyPk = 0xA11CE;
     address companySigner;
 
-    address owner = address(this);
-    address treasuryWallet = address(2);
-    address leadershipWallet = address(3);
-    address achievementWallet = address(4);
-    address poolWallet = address(5);
+    address treasuryWallet = makeAddr("treasury");
+    address leadershipWallet = makeAddr("leadership");
+    address achievementWallet = makeAddr("achievement");
+    address poolWallet = makeAddr("pool");
 
-    address rootUser = address(10);
-    address user1 = address(11);
-    address user2 = address(12);
-    address user3 = address(13);
+    address rootUser = makeAddr("root");
+    address user1 = makeAddr("user1");
+    address user2 = makeAddr("user2");
+    address user3 = makeAddr("user3");
 
     bytes32 constant PURCHASE_OP = keccak256("PURCHASE");
     bytes32 constant UPGRADE_OP = keccak256("UPGRADE");
+
+    uint8 constant HUNTER = uint8(IHNTRMembership.Rank.HUNTER);
+    uint8 constant SCOUT = uint8(IHNTRMembership.Rank.SCOUT);
+    uint8 constant TRACKER = uint8(IHNTRMembership.Rank.TRACKER);
+    uint8 constant RANGER = uint8(IHNTRMembership.Rank.RANGER);
+    uint8 constant RANK_NONE = uint8(IHNTRMembership.Rank.NONE);
 
     function setUp() public {
         companySigner = vm.addr(companyPk);
@@ -41,38 +56,58 @@ contract HNTRMembershipTest is Test {
         membership.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
         membership.setCompanyWallet(companySigner);
 
-        address[4] memory users = [rootUser, user1, user2, user3];
-        for (uint256 i = 0; i < users.length; i++) {
-            usdt.mint(users[i], 100_000 * 1e6);
-            usdc.mint(users[i], 100_000 * 1e6);
-            vm.prank(users[i]);
-            usdt.approve(address(membership), type(uint256).max);
-            vm.prank(users[i]);
-            usdc.approve(address(membership), type(uint256).max);
-        }
+        _fundAndApprove(rootUser);
+        _fundAndApprove(user1);
+        _fundAndApprove(user2);
+        _fundAndApprove(user3);
 
-        // Root: Diamond
-        _purchase(rootUser, IHNTRMembership.Tier.DIAMOND, new address[](0), new uint8[](0));
+        _purchase(rootUser, IHNTRMembership.Tier.DIAMOND, _emptyAddrs(), _emptyRanks());
 
-        // user1: Diamond, upline root at Hunter
         {
-            address[] memory up = new address[](1);
-            up[0] = rootUser;
-            uint8[] memory ranks = new uint8[](1);
-            ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
+            (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
             _purchase(user1, IHNTRMembership.Tier.DIAMOND, up, ranks);
         }
-
-        // user2: Bronze, uplines user1 then root
         {
             address[] memory up = new address[](2);
             up[0] = user1;
             up[1] = rootUser;
             uint8[] memory ranks = new uint8[](2);
-            ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
-            ranks[1] = uint8(IHNTRMembership.Rank.HUNTER);
+            ranks[0] = HUNTER;
+            ranks[1] = HUNTER;
             _purchase(user2, IHNTRMembership.Tier.BRONZE, up, ranks);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function _fundAndApprove(address user) internal {
+        usdt.mint(user, 1_000_000 * 1e6);
+        usdc.mint(user, 1_000_000 * 1e6);
+        vm.startPrank(user);
+        usdt.approve(address(membership), type(uint256).max);
+        usdc.approve(address(membership), type(uint256).max);
+        vm.stopPrank();
+    }
+
+    function _emptyAddrs() internal pure returns (address[] memory a) {
+        a = new address[](0);
+    }
+
+    function _emptyRanks() internal pure returns (uint8[] memory r) {
+        r = new uint8[](0);
+    }
+
+    function _oneUpline(address upline, uint8 rank)
+        internal
+        pure
+        returns (address[] memory up, uint8[] memory ranks)
+    {
+        up = new address[](1);
+        up[0] = upline;
+        ranks = new uint8[](1);
+        ranks[0] = rank;
     }
 
     function _authHash(
@@ -87,11 +122,47 @@ contract HNTRMembershipTest is Test {
         uint256 epoch,
         bytes32 operation
     ) internal view returns (bytes32) {
-        bytes32 uplinesHash = keccak256(abi.encode(uplines));
-        bytes32 ranksHash = keccak256(abi.encode(ranks));
         return keccak256(
-            abi.encode(user, tier, uplinesHash, ranksHash, token, deadline, nonce, epoch, block.chainid, m, operation)
+            abi.encode(
+                user,
+                tier,
+                keccak256(abi.encode(uplines)),
+                keccak256(abi.encode(ranks)),
+                token,
+                deadline,
+                nonce,
+                epoch,
+                block.chainid,
+                m,
+                operation
+            )
         );
+    }
+
+    function _signFor(
+        HNTRMembership m,
+        address user,
+        uint8 tier,
+        address[] memory uplines,
+        uint8[] memory ranks,
+        address token,
+        uint256 deadline,
+        bytes32 operation
+    ) internal view returns (bytes memory) {
+        bytes32 digest = _authHash(
+            address(m),
+            user,
+            tier,
+            uplines,
+            ranks,
+            token,
+            deadline,
+            m.nonces(user),
+            m.signatureEpoch(),
+            operation
+        ).toEthSignedMessageHash();
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
+        return abi.encodePacked(r, s, v);
     }
 
     function _signAuth(
@@ -103,21 +174,7 @@ contract HNTRMembershipTest is Test {
         uint256 deadline,
         bytes32 operation
     ) internal view returns (bytes memory) {
-        bytes32 structHash = _authHash(
-            address(membership),
-            user,
-            tier,
-            uplines,
-            ranks,
-            token,
-            deadline,
-            membership.nonces(user),
-            membership.signatureEpoch(),
-            operation
-        );
-        bytes32 digest = structHash.toEthSignedMessageHash();
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
-        return abi.encodePacked(r, s, v);
+        return _signFor(membership, user, tier, uplines, ranks, token, deadline, operation);
     }
 
     function _purchase(
@@ -126,11 +183,20 @@ contract HNTRMembershipTest is Test {
         address[] memory uplines,
         uint8[] memory ranks
     ) internal {
+        _purchaseToken(user, tier, uplines, ranks, address(usdt));
+    }
+
+    function _purchaseToken(
+        address user,
+        IHNTRMembership.Tier tier,
+        address[] memory uplines,
+        uint8[] memory ranks,
+        address token
+    ) internal {
         uint256 deadline = block.timestamp + 600;
-        bytes memory sig =
-            _signAuth(user, uint8(tier), uplines, ranks, address(usdt), deadline, PURCHASE_OP);
+        bytes memory sig = _signAuth(user, uint8(tier), uplines, ranks, token, deadline, PURCHASE_OP);
         vm.prank(user);
-        membership.purchaseMembership(user, tier, uplines, ranks, address(usdt), deadline, sig);
+        membership.purchaseMembership(user, tier, uplines, ranks, token, deadline, sig);
     }
 
     function _upgrade(
@@ -140,102 +206,414 @@ contract HNTRMembershipTest is Test {
         uint8[] memory ranks
     ) internal {
         uint256 deadline = block.timestamp + 600;
-        bytes memory sig =
-            _signAuth(user, uint8(newTier), uplines, ranks, address(usdt), deadline, UPGRADE_OP);
+        bytes memory sig = _signAuth(user, uint8(newTier), uplines, ranks, address(usdt), deadline, UPGRADE_OP);
         vm.prank(user);
         membership.upgradeMembership(user, newTier, uplines, ranks, address(usdt), deadline, sig);
     }
 
-    function test_PurchaseDistribution() public {
-        uint256 treasuryStart = usdt.balanceOf(treasuryWallet);
-        uint256 leadershipStart = usdt.balanceOf(leadershipWallet);
-        uint256 achievementStart = usdt.balanceOf(achievementWallet);
-        uint256 u1LiquidStart = membership.withdrawableCommissions(user1, address(usdt));
+    function _assertSolvent() internal view {
+        assertGe(usdt.balanceOf(address(membership)), membership.totalWithdrawable(address(usdt)));
+        assertGe(usdc.balanceOf(address(membership)), membership.totalWithdrawable(address(usdc)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Protocol constants / configuration
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_TierPrices() public view {
+        assertEq(membership.tierPrices(IHNTRMembership.Tier.BRONZE), 50 * 1e6);
+        assertEq(membership.tierPrices(IHNTRMembership.Tier.SILVER), 250 * 1e6);
+        assertEq(membership.tierPrices(IHNTRMembership.Tier.GOLD), 750 * 1e6);
+        assertEq(membership.tierPrices(IHNTRMembership.Tier.PLATINUM), 1500 * 1e6);
+        assertEq(membership.tierPrices(IHNTRMembership.Tier.DIAMOND), 2500 * 1e6);
+    }
+
+    function test_LevelPercentagesSumTo65() public view {
+        uint256 sum;
+        for (uint256 i = 0; i < 12; i++) {
+            sum += membership.levelPercentages(i);
+        }
+        assertEq(sum, 65);
+    }
+
+    function test_ConstructorRejectsNon6DecimalTokens() public {
+        MockERC20_18 bad = new MockERC20_18();
+        vm.expectRevert("USDT must be 6 decimals");
+        new HNTRMembership(address(bad), address(usdc));
+    }
+
+    function test_ConstructorRejectsZeroToken() public {
+        vm.expectRevert("Invalid token");
+        new HNTRMembership(address(0), address(usdc));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Purchase / upgrade access & validation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_OnlyMsgSenderCanPurchase() public {
+        address buyer = makeAddr("buyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+
+        vm.prank(user1);
+        vm.expectRevert("Not authorized");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_CannotPurchaseTwice() public {
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(user2, uint8(IHNTRMembership.Tier.SILVER), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        // user2 already bronze from setUp
+        vm.prank(user2);
+        vm.expectRevert("Already a member");
+        membership.purchaseMembership(user2, IHNTRMembership.Tier.SILVER, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_CannotPurchaseNoneTier() public {
+        address buyer = makeAddr("noneTier");
+        _fundAndApprove(buyer);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig = _signAuth(
+            buyer, uint8(IHNTRMembership.Tier.NONE), _emptyAddrs(), _emptyRanks(), address(usdt), deadline, PURCHASE_OP
+        );
+        vm.prank(buyer);
+        vm.expectRevert("Invalid tier");
+        membership.purchaseMembership(
+            buyer, IHNTRMembership.Tier.NONE, _emptyAddrs(), _emptyRanks(), address(usdt), deadline, sig
+        );
+    }
+
+    function test_UnsupportedTokenReverts() public {
+        address buyer = makeAddr("badToken");
+        _fundAndApprove(buyer);
+        address fake = makeAddr("fakeToken");
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig = _signAuth(
+            buyer, uint8(IHNTRMembership.Tier.BRONZE), _emptyAddrs(), _emptyRanks(), fake, deadline, PURCHASE_OP
+        );
+        vm.prank(buyer);
+        vm.expectRevert("Unsupported token");
+        membership.purchaseMembership(
+            buyer, IHNTRMembership.Tier.BRONZE, _emptyAddrs(), _emptyRanks(), fake, deadline, sig
+        );
+    }
+
+    function test_PurchaseWithUSDC() public {
+        address buyer = makeAddr("usdcBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+
+        uint256 treasuryBefore = usdc.balanceOf(treasuryWallet);
+        _purchaseToken(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdc));
+
+        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
+        assertGt(usdc.balanceOf(treasuryWallet), treasuryBefore);
+        _assertSolvent();
+    }
+
+    function test_CannotDowngrade() public {
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        // user1 is Diamond — cannot go to Gold
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(user1, uint8(IHNTRMembership.Tier.GOLD), up, ranks, address(usdt), deadline, UPGRADE_OP);
+        vm.prank(user1);
+        vm.expectRevert("Can only upgrade to higher tier");
+        membership.upgradeMembership(user1, IHNTRMembership.Tier.GOLD, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_CannotUpgradeNonMember() public {
+        address stranger = makeAddr("stranger");
+        _fundAndApprove(stranger);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(stranger, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, UPGRADE_OP);
+        vm.prank(stranger);
+        vm.expectRevert("Not a member");
+        membership.upgradeMembership(
+            stranger, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig
+        );
+    }
+
+    function test_UpgradeUsesPriceDiff() public {
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 balBefore = usdt.balanceOf(user2);
+        _upgrade(user2, IHNTRMembership.Tier.SILVER, up, ranks);
+        // Silver - Bronze = 200
+        assertEq(balBefore - usdt.balanceOf(user2), 200 * 1e6);
+        assertEq(uint8(membership.getUser(user2).tier), uint8(IHNTRMembership.Tier.SILVER));
+        _assertSolvent();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Commission economics
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_FixedSplitsAndBreakage() public {
+        uint256 t0 = usdt.balanceOf(treasuryWallet);
+        uint256 l0 = usdt.balanceOf(leadershipWallet);
+        uint256 a0 = usdt.balanceOf(achievementWallet);
+        uint256 p0 = usdt.balanceOf(poolWallet);
+        uint256 u1Liq0 = membership.withdrawableCommissions(user1, address(usdt));
+        uint256 u1Lock0 = membership.lockedCommissions(user1, address(usdt));
+        uint256 tw0 = membership.totalWithdrawable(address(usdt));
 
         address[] memory uplines = new address[](3);
         uplines[0] = user2;
         uplines[1] = user1;
         uplines[2] = rootUser;
         uint8[] memory ranks = new uint8[](3);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
-        ranks[1] = uint8(IHNTRMembership.Rank.HUNTER);
-        ranks[2] = uint8(IHNTRMembership.Rank.HUNTER);
+        ranks[0] = HUNTER;
+        ranks[1] = HUNTER;
+        ranks[2] = HUNTER;
 
         _purchase(user3, IHNTRMembership.Tier.DIAMOND, uplines, ranks);
 
         uint256 price = 2500 * 1e6;
-        assertEq(usdt.balanceOf(leadershipWallet) - leadershipStart, (price * 5) / 100);
-        assertEq(usdt.balanceOf(achievementWallet) - achievementStart, (price * 5) / 100);
+        // L1 15% + L2 15% + L3 8% = 38%; breakage 27%; treasury 25+27=52
+        assertEq(usdt.balanceOf(leadershipWallet) - l0, (price * 5) / 100);
+        assertEq(usdt.balanceOf(achievementWallet) - a0, (price * 5) / 100);
+        assertEq(usdt.balanceOf(treasuryWallet) - t0, (price * 52) / 100);
 
-        // L1 15% user2, L2 15% user1, L3 8% root = 38%; breakage 27%; treasury 25%+27%=52%
-        assertEq(usdt.balanceOf(treasuryWallet) - treasuryStart, (price * 52) / 100);
+        // Locked to pool: 20% of each level cut = 20% of 38% = 7.6% of price
+        uint256 distributed = (price * 38) / 100;
+        assertEq(usdt.balanceOf(poolWallet) - p0, (distributed * 20) / 100);
 
-        // user1 L2 = 15% of 2500 = 375; liquid 80% = 300
-        assertEq(membership.withdrawableCommissions(user1, address(usdt)) - u1LiquidStart, 300 * 1e6);
+        // user1 L2 liquid = 80% of 15% of 2500 = 300
+        assertEq(membership.withdrawableCommissions(user1, address(usdt)) - u1Liq0, 300 * 1e6);
+        assertEq(membership.lockedCommissions(user1, address(usdt)) - u1Lock0, 75 * 1e6);
+
+        // totalWithdrawable increased by all liquid commissions (80% of 38%)
+        assertEq(membership.totalWithdrawable(address(usdt)) - tw0, (distributed * 80) / 100);
+        _assertSolvent();
     }
 
-    function test_PauseBlocksPurchaseButNotWithdraw() public {
-        uint256 liquid = membership.withdrawableCommissions(user1, address(usdt));
-        require(liquid > 0, "need liquid");
+    function test_Full12LevelDistribution() public {
+        // 12 Diamond+Hunter uplines in a chain; buyer pays Diamond → all 65% paid, 0 breakage beyond 25% base
+        address[] memory chain = new address[](12);
+        for (uint256 i = 0; i < 12; i++) {
+            chain[i] = makeAddr(string(abi.encodePacked("lvl", vm.toString(i))));
+            _fundAndApprove(chain[i]);
+        }
 
-        membership.pause();
+        // Purchase from top of chain downward so each has the lower ones as uplines... 
+        // Actually we need each member to exist first. Seed each with empty then rebuild isn't needed —
+        // purchase each with only higher (already purchased) as upline.
+        _purchase(chain[0], IHNTRMembership.Tier.DIAMOND, _emptyAddrs(), _emptyRanks());
+        for (uint256 i = 1; i < 12; i++) {
+            address[] memory up = new address[](i);
+            uint8[] memory ranks = new uint8[](i);
+            for (uint256 j = 0; j < i; j++) {
+                up[j] = chain[i - 1 - j]; // nearest first
+                ranks[j] = HUNTER;
+            }
+            _purchase(chain[i], IHNTRMembership.Tier.DIAMOND, up, ranks);
+        }
 
-        address[] memory up = new address[](1);
-        up[0] = rootUser;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
+        address buyer = makeAddr("fullBuyer");
+        _fundAndApprove(buyer);
 
-        uint256 deadline = block.timestamp + 600;
-        bytes memory sig =
-            _signAuth(address(0xBEEF), uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
-        usdt.mint(address(0xBEEF), 1000 * 1e6);
-        vm.prank(address(0xBEEF));
-        usdt.approve(address(membership), type(uint256).max);
+        address[] memory uplines = new address[](12);
+        uint8[] memory buyerRanks = new uint8[](12);
+        for (uint256 i = 0; i < 12; i++) {
+            uplines[i] = chain[11 - i]; // nearest = last in chain
+            buyerRanks[i] = HUNTER;
+        }
 
-        vm.prank(address(0xBEEF));
-        vm.expectRevert();
-        membership.purchaseMembership(
-            address(0xBEEF), IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig
-        );
+        uint256 t0 = usdt.balanceOf(treasuryWallet);
+        uint256 price = 2500 * 1e6;
+        _purchase(buyer, IHNTRMembership.Tier.DIAMOND, uplines, buyerRanks);
 
-        // Withdrawals remain available while paused.
+        // All 65% distributed → treasury only gets base 25% (no breakage)
+        assertEq(usdt.balanceOf(treasuryWallet) - t0, (price * 25) / 100);
+        _assertSolvent();
+    }
+
+    function test_DynamicCompressionSkipsUnqualified() public {
+        // Bronze member with rank NONE cannot earn L4 (needs Bronze+Scout).
+        // Place them first; L4 should compress to the next qualified Diamond/Hunter.
+        address bronze = makeAddr("bronzeGate");
+        address deep = makeAddr("deepLeader");
+        address buyer = makeAddr("compressBuyer");
+        _fundAndApprove(bronze);
+        _fundAndApprove(deep);
+        _fundAndApprove(buyer);
+
+        _purchase(deep, IHNTRMembership.Tier.DIAMOND, _emptyAddrs(), _emptyRanks());
+        {
+            (address[] memory upB, uint8[] memory ranksB) = _oneUpline(deep, HUNTER);
+            _purchase(bronze, IHNTRMembership.Tier.BRONZE, upB, ranksB);
+        }
+
+        // Build 4 uplines: 3 Diamond/Hunter then bronze with NONE rank for L4 slot attempt.
+        // Compression: L1-L3 go to first three Diamond; L4 skips bronze (rank NONE < SCOUT), goes to deep.
+        address a = makeAddr("a");
+        address b = makeAddr("b");
+        address c = makeAddr("c");
+        _fundAndApprove(a);
+        _fundAndApprove(b);
+        _fundAndApprove(c);
+        _purchase(a, IHNTRMembership.Tier.DIAMOND, _emptyAddrs(), _emptyRanks());
+        {
+            (address[] memory upA, uint8[] memory ranksA) = _oneUpline(a, HUNTER);
+            _purchase(b, IHNTRMembership.Tier.DIAMOND, upA, ranksA);
+        }
+        {
+            address[] memory upC = new address[](2);
+            upC[0] = b;
+            upC[1] = a;
+            uint8[] memory ranksC = new uint8[](2);
+            ranksC[0] = HUNTER;
+            ranksC[1] = HUNTER;
+            _purchase(c, IHNTRMembership.Tier.DIAMOND, upC, ranksC);
+        }
+
+        address[] memory uplines = new address[](5);
+        uplines[0] = c;
+        uplines[1] = b;
+        uplines[2] = a;
+        uplines[3] = bronze; // unqualified for L4
+        uplines[4] = deep; // should get L4
+        uint8[] memory ranks = new uint8[](5);
+        ranks[0] = HUNTER;
+        ranks[1] = HUNTER;
+        ranks[2] = HUNTER;
+        ranks[3] = RANK_NONE;
+        ranks[4] = HUNTER;
+
+        uint256 deepLiq0 = membership.withdrawableCommissions(deep, address(usdt));
+        uint256 bronzeLiq0 = membership.withdrawableCommissions(bronze, address(usdt));
+
+        _purchase(buyer, IHNTRMembership.Tier.DIAMOND, uplines, ranks);
+
+        // L4 = 5% of 2500 = 125; liquid 80% = 100 → deep
+        assertEq(membership.withdrawableCommissions(deep, address(usdt)) - deepLiq0, 100 * 1e6);
+        // bronze should not have gained from this sale's L4
+        assertEq(membership.withdrawableCommissions(bronze, address(usdt)), bronzeLiq0);
+        _assertSolvent();
+    }
+
+    function test_EightyTwentySplitOnCommission() public {
+        address buyer = makeAddr("8020");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+
+        uint256 liq0 = membership.withdrawableCommissions(rootUser, address(usdt));
+        uint256 lock0 = membership.lockedCommissions(rootUser, address(usdt));
+        uint256 pool0 = usdt.balanceOf(poolWallet);
+
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+
+        uint256 cut = (50 * 1e6 * 15) / 100; // L1
+        assertEq(membership.withdrawableCommissions(rootUser, address(usdt)) - liq0, (cut * 80) / 100);
+        assertEq(membership.lockedCommissions(rootUser, address(usdt)) - lock0, cut - (cut * 80) / 100);
+        assertEq(usdt.balanceOf(poolWallet) - pool0, cut - (cut * 80) / 100);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Withdrawals / company sweep
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_WithdrawCommissions() public {
+        uint256 amount = membership.withdrawableCommissions(user1, address(usdt));
+        assertGt(amount, 0);
+        uint256 tw0 = membership.totalWithdrawable(address(usdt));
+        uint256 bal0 = usdt.balanceOf(user1);
+
         vm.prank(user1);
         membership.withdrawCommissions(user1, address(usdt));
+
         assertEq(membership.withdrawableCommissions(user1, address(usdt)), 0);
+        assertEq(membership.totalWithdrawable(address(usdt)), tw0 - amount);
+        assertEq(usdt.balanceOf(user1), bal0 + amount);
+        assertGt(membership.lastClaimedAt(user1, address(usdt)), 0);
+        _assertSolvent();
     }
 
-    function test_Ownable2StepTransfer() public {
-        address newOwner = address(0xABCD);
-        membership.transferOwnership(newOwner);
-        assertEq(membership.pendingOwner(), newOwner);
-        assertEq(membership.owner(), address(this));
-
-        vm.prank(newOwner);
-        membership.acceptOwnership();
-        assertEq(membership.owner(), newOwner);
+    function test_WithdrawOnlySelf() public {
+        vm.prank(user2);
+        vm.expectRevert("Not authorized");
+        membership.withdrawCommissions(user1, address(usdt));
     }
 
-    function test_NoncePreventsReplay() public {
-        address buyer = address(0xC0FFEE);
-        usdt.mint(buyer, 1000 * 1e6);
-        vm.prank(buyer);
-        usdt.approve(address(membership), type(uint256).max);
+    function test_CompanyWalletSweepSendsToUser() public {
+        uint256 amount = membership.withdrawableCommissions(user1, address(usdt));
+        assertGt(amount, 0);
+        // never claimed → overdue immediately (lastClaimedAt == 0)
+        uint256 bal0 = usdt.balanceOf(user1);
 
-        address[] memory up = new address[](1);
-        up[0] = rootUser;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
+        vm.prank(companySigner);
+        membership.withdrawCompanyWallet(user1, address(usdt));
 
+        assertEq(usdt.balanceOf(user1), bal0 + amount);
+        assertEq(membership.withdrawableCommissions(user1, address(usdt)), 0);
+        // company signer did not receive funds
+        assertEq(usdt.balanceOf(companySigner), 0);
+    }
+
+    function test_CompanyWalletSweepBlockedWithinGrace() public {
+        vm.prank(user1);
+        membership.withdrawCommissions(user1, address(usdt));
+
+        // Earn again
+        address buyer = makeAddr("earnAgain");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(user1, HUNTER);
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+        assertGt(membership.withdrawableCommissions(user1, address(usdt)), 0);
+
+        vm.prank(companySigner);
+        vm.expectRevert("Claim not overdue");
+        membership.withdrawCompanyWallet(user1, address(usdt));
+
+        vm.warp(block.timestamp + 30 days + 1);
+        uint256 amt = membership.withdrawableCommissions(user1, address(usdt));
+        uint256 bal0 = usdt.balanceOf(user1);
+        vm.prank(companySigner);
+        membership.withdrawCompanyWallet(user1, address(usdt));
+        assertEq(usdt.balanceOf(user1), bal0 + amt);
+    }
+
+    function test_OnlyCompanyWalletCanSweep() public {
+        vm.prank(user1);
+        vm.expectRevert("Not company wallet");
+        membership.withdrawCompanyWallet(user1, address(usdt));
+    }
+
+    function test_GetOverdueWallets() public {
+        vm.prank(companySigner);
+        address[] memory overdue = membership.getOverdueWallets(address(usdt));
+        assertGt(overdue.length, 0);
+
+        // Non-company cannot call
+        vm.prank(user1);
+        vm.expectRevert("Not company wallet");
+        membership.getOverdueWallets(address(usdt));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-01 Signature hardening
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_NonceIncrementsAndBlocksReplay() public {
+        address buyer = makeAddr("nonceBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+
+        assertEq(membership.nonces(buyer), 0);
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+        assertEq(membership.nonces(buyer), 1);
+
+        // Stale nonce=0 upgrade sig
         uint256 deadline = block.timestamp + 600;
-        bytes memory sig =
-            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
-
-        vm.prank(buyer);
-        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
-
-        // Prove nonce: sign upgrade with stale nonce=0 while current nonce=1.
-        uint256 staleNonce = 0;
-        bytes32 structHash = _authHash(
+        bytes32 digest = _authHash(
             address(membership),
             buyer,
             uint8(IHNTRMembership.Tier.SILVER),
@@ -243,214 +621,370 @@ contract HNTRMembershipTest is Test {
             ranks,
             address(usdt),
             deadline,
-            staleNonce,
+            0,
             membership.signatureEpoch(),
             UPGRADE_OP
-        );
-        bytes32 digest = structHash.toEthSignedMessageHash();
+        ).toEthSignedMessageHash();
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
-        bytes memory staleSig = abi.encodePacked(r, s, v);
 
         vm.prank(buyer);
         vm.expectRevert("Invalid signature");
         membership.upgradeMembership(
-            buyer, IHNTRMembership.Tier.SILVER, up, ranks, address(usdt), deadline, staleSig
+            buyer, IHNTRMembership.Tier.SILVER, up, ranks, address(usdt), deadline, abi.encodePacked(r, s, v)
         );
     }
 
-    function test_InvalidateSignatures() public {
-        address buyer = address(0xD00D);
-        usdt.mint(buyer, 1000 * 1e6);
-        vm.prank(buyer);
-        usdt.approve(address(membership), type(uint256).max);
-
-        address[] memory up = new address[](1);
-        up[0] = rootUser;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
+    function test_InvalidateSignaturesBumpsEpoch() public {
+        address buyer = makeAddr("epochBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
 
         uint256 deadline = block.timestamp + 600;
         bytes memory sig =
             _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
 
+        assertEq(membership.signatureEpoch(), 0);
         membership.invalidateSignatures();
+        assertEq(membership.signatureEpoch(), 1);
 
         vm.prank(buyer);
         vm.expectRevert("Invalid signature");
         membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
 
-        // Fresh signature at new epoch works.
         _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
-        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
     }
 
-    function test_RejectSelfAndDuplicateUplines() public {
-        address buyer = address(0x5E1F);
-        usdt.mint(buyer, 1000 * 1e6);
-        vm.prank(buyer);
-        usdt.approve(address(membership), type(uint256).max);
-
-        address[] memory selfUp = new address[](1);
-        selfUp[0] = buyer;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
-
-        uint256 deadline = block.timestamp + 600;
+    function test_ExpiredSignatureReverts() public {
+        address buyer = makeAddr("expired");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 10;
         bytes memory sig =
-            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), selfUp, ranks, address(usdt), deadline, PURCHASE_OP);
-
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.warp(deadline + 1);
         vm.prank(buyer);
-        vm.expectRevert("Self upline");
-        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, selfUp, ranks, address(usdt), deadline, sig);
-
-        address[] memory dup = new address[](2);
-        dup[0] = rootUser;
-        dup[1] = rootUser;
-        uint8[] memory ranks2 = new uint8[](2);
-        ranks2[0] = uint8(IHNTRMembership.Rank.HUNTER);
-        ranks2[1] = uint8(IHNTRMembership.Rank.HUNTER);
-        bytes memory sig2 =
-            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), dup, ranks2, address(usdt), deadline, PURCHASE_OP);
-
-        vm.prank(buyer);
-        vm.expectRevert("Duplicate upline");
-        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, dup, ranks2, address(usdt), deadline, sig2);
+        vm.expectRevert("Signature expired");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
     }
 
-    function test_RescueCannotDipBelowLiabilities() public {
-        uint256 liability = membership.totalWithdrawable(address(usdt));
-        assertGt(liability, 0);
-
-        uint256 bal = usdt.balanceOf(address(membership));
-        // Try to rescue everything — must fail.
-        vm.expectRevert("Below liabilities");
-        membership.rescueToken(address(usdt), owner, bal);
-
-        // Rescue dust above liabilities is OK if any.
-        if (bal > liability) {
-            uint256 excess = bal - liability;
-            membership.rescueToken(address(usdt), owner, excess);
-            assertEq(usdt.balanceOf(address(membership)), liability);
-        }
-    }
-
-    function test_FeeOnTransferUsesReceivedAmount() public {
-        // Deploy a separate membership wired to a fee-on-transfer token as both usdt/usdc.
-        MockFeeOnTransferERC20 feeToken = new MockFeeOnTransferERC20(10); // 0.1%
-        MockFeeOnTransferERC20 feeToken2 = new MockFeeOnTransferERC20(10);
-        // Need two 6-decimal tokens for constructor; mint/approve via feeToken as USDT.
-        // Constructor requires decimals==6 on both — feeToken2 is also 6.
-        HNTRMembership feeMembership = new HNTRMembership(address(feeToken), address(feeToken2));
-        feeMembership.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
-        feeMembership.setCompanyWallet(companySigner);
-
-        address buyer = address(0xFEE1);
-        address upline = address(0xA011);
-        feeToken.mint(buyer, 10_000 * 1e6);
-        feeToken.mint(upline, 10_000 * 1e6);
-        vm.prank(buyer);
-        feeToken.approve(address(feeMembership), type(uint256).max);
-        vm.prank(upline);
-        feeToken.approve(address(feeMembership), type(uint256).max);
-
-        // Upline buys first (empty uplines).
-        {
-            uint256 deadline = block.timestamp + 600;
-            address[] memory empty = new address[](0);
-            uint8[] memory emptyR = new uint8[](0);
-            bytes32 structHash = _authHash(
-                address(feeMembership),
-                upline,
-                uint8(IHNTRMembership.Tier.DIAMOND),
-                empty,
-                emptyR,
-                address(feeToken),
-                deadline,
-                feeMembership.nonces(upline),
-                feeMembership.signatureEpoch(),
-                PURCHASE_OP
-            );
-            bytes32 digest = structHash.toEthSignedMessageHash();
-            (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
-            vm.prank(upline);
-            feeMembership.purchaseMembership(
-                upline,
-                IHNTRMembership.Tier.DIAMOND,
-                empty,
-                emptyR,
-                address(feeToken),
-                deadline,
-                abi.encodePacked(r, s, v)
-            );
-        }
-
-        address[] memory up = new address[](1);
-        up[0] = upline;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
-
-        uint256 price = 50 * 1e6; // Bronze
-        uint256 expectedReceived = price - (price * 10) / 10_000;
-
-        uint256 deadline2 = block.timestamp + 600;
-        bytes32 structHash2 = _authHash(
-            address(feeMembership),
+    function test_WrongSignerReverts() public {
+        address buyer = makeAddr("wrongSig");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes32 digest = _authHash(
+            address(membership),
             buyer,
             uint8(IHNTRMembership.Tier.BRONZE),
             up,
             ranks,
-            address(feeToken),
-            deadline2,
-            feeMembership.nonces(buyer),
-            feeMembership.signatureEpoch(),
+            address(usdt),
+            deadline,
+            0,
+            0,
             PURCHASE_OP
-        );
-        bytes32 digest2 = structHash2.toEthSignedMessageHash();
-        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(companyPk, digest2);
+        ).toEthSignedMessageHash();
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xB0B, digest); // not company key
 
-        uint256 contractBefore = feeToken.balanceOf(address(feeMembership));
         vm.prank(buyer);
-        feeMembership.purchaseMembership(
-            buyer,
-            IHNTRMembership.Tier.BRONZE,
-            up,
-            ranks,
-            address(feeToken),
-            deadline2,
-            abi.encodePacked(r2, s2, v2)
+        vm.expectRevert("Invalid signature");
+        membership.purchaseMembership(
+            buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, abi.encodePacked(r, s, v)
         );
-
-        // Solvency: contract balance >= totalWithdrawable
-        assertGe(feeToken.balanceOf(address(feeMembership)), feeMembership.totalWithdrawable(address(feeToken)));
-
-        // Upline L1 liquid = 80% of 15% of received
-        uint256 levelCut = (expectedReceived * 15) / 100;
-        uint256 liquid = (levelCut * 80) / 100;
-        assertEq(feeMembership.withdrawableCommissions(upline, address(feeToken)), liquid);
-
-        // Contract should not have gone insolvent vs requested amount accounting
-        assertTrue(feeToken.balanceOf(address(feeMembership)) + 1 >= contractBefore); // smoke
     }
 
-    function test_ZeroWalletRejected() public {
+    function test_CrossOperationReplayBlocked() public {
+        // Purchase sig cannot be used for upgrade
+        address buyer = makeAddr("crossOp");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+
+        uint256 deadline = block.timestamp + 600;
+        // Sign PURCHASE for Silver (wrong op tag for upgrade)
+        bytes memory purchaseSig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.SILVER), up, ranks, address(usdt), deadline, PURCHASE_OP);
+
+        vm.prank(buyer);
+        vm.expectRevert("Invalid signature");
+        membership.upgradeMembership(
+            buyer, IHNTRMembership.Tier.SILVER, up, ranks, address(usdt), deadline, purchaseSig
+        );
+    }
+
+    function test_LengthMismatchReverts() public {
+        address buyer = makeAddr("lenMis");
+        _fundAndApprove(buyer);
+        address[] memory up = new address[](1);
+        up[0] = rootUser;
+        uint8[] memory ranks = new uint8[](2);
+        ranks[0] = HUNTER;
+        ranks[1] = HUNTER;
+        uint256 deadline = block.timestamp + 600;
+        // Craft hash with mismatched arrays so we hit length check before sig
+        // Actually length check happens before sig verify — any bytes ok
+        vm.prank(buyer);
+        vm.expectRevert("Length mismatch");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, hex"00");
+    }
+
+    function test_InvalidRankReverts() public {
+        address buyer = makeAddr("badRank");
+        _fundAndApprove(buyer);
+        address[] memory up = new address[](1);
+        up[0] = rootUser;
+        uint8[] memory ranks = new uint8[](1);
+        ranks[0] = 99;
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Invalid rank");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-02 / SEC-03 Ownable2Step, Pause, Rescue
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_Ownable2Step() public {
+        address next = makeAddr("multisig");
+        membership.transferOwnership(next);
+        assertEq(membership.pendingOwner(), next);
+        assertEq(membership.owner(), address(this));
+
+        vm.prank(next);
+        membership.acceptOwnership();
+        assertEq(membership.owner(), next);
+
+        vm.expectRevert();
+        membership.pause(); // old owner lost access
+    }
+
+    function test_OnlyOwnerAdmin() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        membership.pause();
+
+        vm.prank(user1);
+        vm.expectRevert();
+        membership.invalidateSignatures();
+
+        vm.prank(user1);
+        vm.expectRevert();
+        membership.setCompanyWallet(user1);
+    }
+
+    function test_PauseBlocksEntryUnpauseRestores() public {
+        membership.pause();
+        assertTrue(membership.paused());
+
+        address buyer = makeAddr("pausedBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+
+        vm.prank(buyer);
+        vm.expectRevert();
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+
+        // withdraw still works
+        uint256 amt = membership.withdrawableCommissions(user1, address(usdt));
+        vm.prank(user1);
+        membership.withdrawCommissions(user1, address(usdt));
+        assertEq(membership.withdrawableCommissions(user1, address(usdt)), 0);
+        assertGt(amt, 0);
+
+        membership.unpause();
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
+    }
+
+    function test_PauseBlocksUpgrade() public {
+        membership.pause();
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(user2, uint8(IHNTRMembership.Tier.SILVER), up, ranks, address(usdt), deadline, UPGRADE_OP);
+        vm.prank(user2);
+        vm.expectRevert();
+        membership.upgradeMembership(user2, IHNTRMembership.Tier.SILVER, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_RescueRespectsLiabilities() public {
+        uint256 liability = membership.totalWithdrawable(address(usdt));
+        uint256 bal = usdt.balanceOf(address(membership));
+        assertGe(bal, liability);
+
+        vm.expectRevert("Below liabilities");
+        membership.rescueToken(address(usdt), address(this), bal);
+
+        if (bal > liability) {
+            membership.rescueToken(address(usdt), address(this), bal - liability);
+            assertEq(usdt.balanceOf(address(membership)), liability);
+        }
+        _assertSolvent();
+    }
+
+    function test_RescueWrongTokenUnrestricted() public {
+        MockERC20 other = new MockERC20();
+        other.mint(address(membership), 1000 * 1e6);
+        membership.rescueToken(address(other), address(this), 1000 * 1e6);
+        assertEq(other.balanceOf(address(this)), 1000 * 1e6);
+    }
+
+    function test_RescueZeroRecipientReverts() public {
+        vm.expectRevert("Zero recipient");
+        membership.rescueToken(address(usdt), address(0), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-04 Fee-on-transfer / measured receipt
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_FeeOnTransferDistributesReceived() public {
+        MockFeeOnTransferERC20 feeUsdt = new MockFeeOnTransferERC20(10);
+        MockFeeOnTransferERC20 feeUsdc = new MockFeeOnTransferERC20(10);
+        HNTRMembership m = new HNTRMembership(address(feeUsdt), address(feeUsdc));
+        m.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
+        m.setCompanyWallet(companySigner);
+
+        address upline = makeAddr("feeUpline");
+        address buyer = makeAddr("feeBuyer");
+        feeUsdt.mint(upline, 50_000 * 1e6);
+        feeUsdt.mint(buyer, 50_000 * 1e6);
+        vm.prank(upline);
+        feeUsdt.approve(address(m), type(uint256).max);
+        vm.prank(buyer);
+        feeUsdt.approve(address(m), type(uint256).max);
+
+        {
+            uint256 deadline = block.timestamp + 600;
+            bytes memory sig = _signFor(
+                m, upline, uint8(IHNTRMembership.Tier.DIAMOND), _emptyAddrs(), _emptyRanks(), address(feeUsdt), deadline, PURCHASE_OP
+            );
+            vm.prank(upline);
+            m.purchaseMembership(
+                upline, IHNTRMembership.Tier.DIAMOND, _emptyAddrs(), _emptyRanks(), address(feeUsdt), deadline, sig
+            );
+        }
+
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(upline, HUNTER);
+        uint256 price = 50 * 1e6;
+        uint256 received = price - (price * 10) / 10_000;
+
+        uint256 deadline2 = block.timestamp + 600;
+        bytes memory sig2 = _signFor(
+            m, buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(feeUsdt), deadline2, PURCHASE_OP
+        );
+        vm.prank(buyer);
+        m.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(feeUsdt), deadline2, sig2);
+
+        uint256 levelCut = (received * 15) / 100;
+        assertEq(m.withdrawableCommissions(upline, address(feeUsdt)), (levelCut * 80) / 100);
+        assertGe(feeUsdt.balanceOf(address(m)), m.totalWithdrawable(address(feeUsdt)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-05 Upline hygiene + Appendix A
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_RejectSelfUpline() public {
+        address buyer = makeAddr("selfUp");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(buyer, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Self upline");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_RejectZeroUpline() public {
+        address buyer = makeAddr("zeroUp");
+        _fundAndApprove(buyer);
+        address[] memory up = new address[](1);
+        up[0] = address(0);
+        uint8[] memory ranks = new uint8[](1);
+        ranks[0] = HUNTER;
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Zero upline");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_RejectDuplicateUpline() public {
+        address buyer = makeAddr("dupUp");
+        _fundAndApprove(buyer);
+        address[] memory up = new address[](2);
+        up[0] = rootUser;
+        up[1] = rootUser;
+        uint8[] memory ranks = new uint8[](2);
+        ranks[0] = HUNTER;
+        ranks[1] = HUNTER;
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Duplicate upline");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_TooManyUplinesReverts() public {
+        address buyer = makeAddr("tooMany");
+        _fundAndApprove(buyer);
+        address[] memory up = new address[](65);
+        uint8[] memory ranks = new uint8[](65);
+        for (uint256 i = 0; i < 65; i++) {
+            up[i] = address(uint160(1000 + i));
+            ranks[i] = HUNTER;
+        }
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Too many uplines");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    function test_ZeroWalletSettersRejected() public {
         vm.expectRevert("Zero wallet");
         membership.setCompanyWallet(address(0));
 
         vm.expectRevert("Zero wallet");
         membership.setWallets(address(0), leadershipWallet, achievementWallet, poolWallet);
+
+        vm.expectRevert("Zero wallet");
+        membership.setWallets(treasuryWallet, address(0), achievementWallet, poolWallet);
     }
 
-    function test_UpgradeUsesPriceDiff() public {
-        address[] memory up = new address[](1);
-        up[0] = rootUser;
-        uint8[] memory ranks = new uint8[](1);
-        ranks[0] = uint8(IHNTRMembership.Rank.HUNTER);
+    function test_SetWalletsUpdates() public {
+        address t = makeAddr("t2");
+        address l = makeAddr("l2");
+        address a = makeAddr("a2");
+        address p = makeAddr("p2");
+        membership.setWallets(t, l, a, p);
+        assertEq(membership.treasuryWallet(), t);
+        assertEq(membership.leadershipWallet(), l);
+        assertEq(membership.achievementWallet(), a);
+        assertEq(membership.poolWallet(), p);
+    }
 
-        uint256 treasuryBefore = usdt.balanceOf(treasuryWallet);
-        _upgrade(user2, IHNTRMembership.Tier.SILVER, up, ranks);
+    function test_SolvencyInvariantAfterWithdraw() public {
+        _assertSolvent();
+        vm.prank(user1);
+        membership.withdrawCommissions(user1, address(usdt));
+        _assertSolvent();
 
-        // Silver 250 - Bronze 50 = 200; treasury gets at least 25% of 200
-        assertGe(usdt.balanceOf(treasuryWallet) - treasuryBefore, (200 * 1e6 * 25) / 100);
-        assertEq(uint8(membership.getUser(user2).tier), uint8(IHNTRMembership.Tier.SILVER));
+        address buyer = makeAddr("solvBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        _purchase(buyer, IHNTRMembership.Tier.GOLD, up, ranks);
+        _assertSolvent();
     }
 }
