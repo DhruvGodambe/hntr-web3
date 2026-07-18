@@ -13,12 +13,17 @@ contract DeployHNTRMembership is Script {
 
         address usdt;
         address usdc;
-        bool isLocalOrTestnet = block.chainid == 31337 || block.chainid == 11155111;
 
-        // Start broadcasting transactions
+        // Local Anvil (31337) -> deploy fresh mocks. Sepolia (11155111) and any other
+        // non-local chain -> read USDT/USDC addresses from env. The Sepolia addresses
+        // below match the frontend .env.local values used by hntr-web-nextjs.
+        //   USDT: 0x27ac10AEEAea707C4843c8aF4DB52C244D0D8E95
+        //   USDC: 0xEF1b555b3130A3AD46a3161F314b1189b5453D15
+        bool isLocal = block.chainid == 31337;
+
         vm.startBroadcast(deployerPrivateKey);
 
-        if (isLocalOrTestnet) {
+        if (isLocal) {
             console2.log("--- Deploying Mock Tokens ---");
             MockERC20 mockUSDT = new MockERC20();
             mockUSDT.mint(deployer, 1000000 * 10 ** 6);
@@ -39,37 +44,36 @@ contract DeployHNTRMembership is Script {
         HNTRMembership membership = new HNTRMembership(usdt, usdc);
         console2.log("HNTRMembership deployed at:", address(membership));
 
-        // --- Configure wallets & the burner relayer -------------------------------------
-        // Without this step burnerWallet/treasuryWallet/... all default to address(0),
-        // which means onlyBurnerWallet can NEVER be satisfied (msg.sender is never 0x0)
-        // and every ERC20 transfer to the unset wallets would revert -> every purchase,
-        // upgrade and commission withdrawal would permanently fail on a "raw" deployment.
+        // --- Configure protocol wallets ---------------------------------------------
+        // Without this step treasuryWallet/leadershipWallet/achievementWallet/poolWallet/
+        // companyWallet all default to address(0), so every ERC20 transfer to an unset
+        // wallet would revert and the contract would be unusable.
         //
-        // On local/testnet chains, any wallet left unset in the environment falls back to
-        // the deployer address so a bare `forge script` run is immediately usable. On any
+        // On local chains, any wallet left unset in the environment falls back to the
+        // deployer address so a bare `forge script` run is immediately usable. On any
         // other chain, ALL five addresses are required and the script reverts if missing.
         address treasuryWallet;
         address leadershipWallet;
         address achievementWallet;
         address poolWallet;
-        address burnerWallet;
+        address companyWallet;
 
-        if (isLocalOrTestnet) {
+        if (isLocal) {
             treasuryWallet = vm.envOr("TREASURY_WALLET", deployer);
             leadershipWallet = vm.envOr("LEADERSHIP_WALLET", deployer);
             achievementWallet = vm.envOr("ACHIEVEMENT_WALLET", deployer);
             poolWallet = vm.envOr("POOL_WALLET", deployer);
-            burnerWallet = vm.envOr("BURNER_WALLET", deployer);
+            companyWallet = vm.envOr("COMPANY_WALLET", deployer);
         } else {
             treasuryWallet = vm.envAddress("TREASURY_WALLET");
             leadershipWallet = vm.envAddress("LEADERSHIP_WALLET");
             achievementWallet = vm.envAddress("ACHIEVEMENT_WALLET");
             poolWallet = vm.envAddress("POOL_WALLET");
-            burnerWallet = vm.envAddress("BURNER_WALLET");
+            companyWallet = vm.envAddress("COMPANY_WALLET");
         }
 
         membership.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
-        membership.setBurnerWallet(burnerWallet);
+        membership.setCompanyWallet(companyWallet);
 
         vm.stopBroadcast();
 
@@ -78,11 +82,10 @@ contract DeployHNTRMembership is Script {
         console2.log("Leadership Wallet: ", leadershipWallet);
         console2.log("Achievement Wallet:", achievementWallet);
         console2.log("Pool Wallet:       ", poolWallet);
-        console2.log("Burner Wallet:     ", burnerWallet);
+        console2.log("Company Wallet:    ", companyWallet);
 
-        // Sanity check: fail loudly (rather than silently deploying a bricked contract)
-        // if the burner wallet somehow ended up unset.
-        require(membership.burnerWallet() != address(0), "DEPLOY: burnerWallet not configured");
+        // Sanity check: fail loudly if a critical wallet somehow ended up unset.
+        require(membership.companyWallet() != address(0), "DEPLOY: companyWallet not configured");
         require(membership.treasuryWallet() != address(0), "DEPLOY: treasuryWallet not configured");
     }
 }
