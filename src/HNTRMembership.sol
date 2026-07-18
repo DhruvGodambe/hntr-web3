@@ -3,15 +3,21 @@ pragma solidity ^0.8.24;
 
 import {IHNTRMembership} from "./IHNTRMembership.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {Ownable2Step} from "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
+import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-contract HNTRMembership is IHNTRMembership {
+contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     bytes32 public constant PURCHASE_OP = keccak256("PURCHASE");
     bytes32 public constant UPGRADE_OP = keccak256("UPGRADE");
+    uint256 public constant MAX_UPLINES = 64;
 
     address public immutable usdt;
     address public immutable usdc;
@@ -21,7 +27,6 @@ contract HNTRMembership is IHNTRMembership {
     address public achievementWallet;
     address public poolWallet;
     address public companyWallet;
-    address public owner;
 
     mapping(address => User) public users;
 
@@ -35,8 +40,17 @@ contract HNTRMembership is IHNTRMembership {
     mapping(address => mapping(address => uint256)) public withdrawableCommissions;
     mapping(address => mapping(address => uint256)) public lockedCommissions;
 
+    // Running sum of withdrawableCommissions[user][token] across all users (for rescue invariant).
+    mapping(address => uint256) public totalWithdrawable;
+
     // Last time a user claimed commissions for a specific token.
     mapping(address => mapping(address => uint256)) public lastClaimedAt;
+
+    // Per-user nonce included in commission-auth signatures (SEC-01).
+    mapping(address => uint256) public nonces;
+
+    // Global epoch; owner bump invalidates all outstanding signatures (SEC-01).
+    uint256 public signatureEpoch;
 
     // Unilevel commission percentages by level (1-based index).
     uint256[12] public levelPercentages = [15, 15, 8, 5, 4, 4, 4, 2, 2, 2, 2, 2];
@@ -68,24 +82,21 @@ contract HNTRMembership is IHNTRMembership {
     event CompanyWalletWithdrawn(address indexed user, address indexed token, uint256 amount, address indexed companyWallet);
     event WalletsUpdated(address treasury, address leadership, address achievement, address poolWallet);
     event CompanyWalletUpdated(address companyWallet);
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
-    }
+    event SignaturesInvalidated(uint256 newEpoch);
+    event TokensRescued(address indexed token, address indexed to, uint256 amount);
 
     modifier onlyCompanyWallet() {
         require(msg.sender == companyWallet, "Not company wallet");
         _;
     }
 
-    constructor(
-        address _usdt,
-        address _usdc
-    ) {
+    constructor(address _usdt, address _usdc) Ownable(msg.sender) {
+        require(_usdt != address(0) && _usdc != address(0), "Invalid token");
+        require(IERC20Metadata(_usdt).decimals() == 6, "USDT must be 6 decimals");
+        require(IERC20Metadata(_usdc).decimals() == 6, "USDC must be 6 decimals");
+
         usdt = _usdt;
         usdc = _usdc;
-        owner = msg.sender;
 
         // Initialize tier prices (in 6-decimal stablecoin units).
         tierPrices[Tier.BRONZE] = 50 * 1e6;
@@ -95,7 +106,28 @@ contract HNTRMembership is IHNTRMembership {
         tierPrices[Tier.DIAMOND] = 2500 * 1e6;
     }
 
-    function setWallets(address _treasury, address _leadership, address _achievement, address _poolWallet) external onlyOwner {
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @notice Bump the global signature epoch, invalidating every outstanding commission-auth signature.
+    function invalidateSignatures() external onlyOwner {
+        signatureEpoch++;
+        emit SignaturesInvalidated(signatureEpoch);
+    }
+
+    function setWallets(address _treasury, address _leadership, address _achievement, address _poolWallet)
+        external
+        onlyOwner
+    {
+        require(
+            _treasury != address(0) && _leadership != address(0) && _achievement != address(0) && _poolWallet != address(0),
+            "Zero wallet"
+        );
         treasuryWallet = _treasury;
         leadershipWallet = _leadership;
         achievementWallet = _achievement;
@@ -104,8 +136,25 @@ contract HNTRMembership is IHNTRMembership {
     }
 
     function setCompanyWallet(address _companyWallet) external onlyOwner {
+        require(_companyWallet != address(0), "Zero wallet");
         companyWallet = _companyWallet;
         emit CompanyWalletUpdated(_companyWallet);
+    }
+
+    /// @notice Rescue tokens mistakenly sent to this contract.
+    /// For USDT/USDC, cannot reduce the contract balance below totalWithdrawable[token].
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Zero recipient");
+        require(amount > 0, "Zero amount");
+
+        if (token == usdt || token == usdc) {
+            uint256 bal = IERC20(token).balanceOf(address(this));
+            require(bal >= amount, "Insufficient balance");
+            require(bal - amount >= totalWithdrawable[token], "Below liabilities");
+        }
+
+        IERC20(token).safeTransfer(to, amount);
+        emit TokensRescued(token, to, amount);
     }
 
     function getUser(address user) external view override returns (User memory) {
@@ -120,27 +169,25 @@ contract HNTRMembership is IHNTRMembership {
         address token,
         uint256 deadline,
         bytes calldata signature
-    ) external override {
+    ) external override whenNotPaused nonReentrant {
         require(msg.sender == user, "Not authorized");
         require(tier != Tier.NONE, "Invalid tier");
         require(users[user].tier == Tier.NONE, "Already a member");
         require(token == usdt || token == usdc, "Unsupported token");
 
         _verifyCommissionAuth(user, uint8(tier), uplines, ranks, token, deadline, PURCHASE_OP, signature);
+        nonces[user]++;
 
         uint256 price = tierPrices[tier];
         require(price > 0, "Tier price not set");
 
-        users[user] = User({
-            tier: tier,
-            joinedAt: block.timestamp
-        });
+        users[user] = User({tier: tier, joinedAt: block.timestamp});
 
         allUsers.push(user);
 
-        _processPaymentAndDistribution(user, price, uplines, ranks, token);
+        uint256 received = _processPaymentAndDistribution(user, price, uplines, ranks, token);
 
-        emit MembershipPurchased(user, tier, price, token);
+        emit MembershipPurchased(user, tier, received, token);
     }
 
     function upgradeMembership(
@@ -151,7 +198,7 @@ contract HNTRMembership is IHNTRMembership {
         address token,
         uint256 deadline,
         bytes calldata signature
-    ) external override {
+    ) external override whenNotPaused nonReentrant {
         require(msg.sender == user, "Not authorized");
         User storage u = users[user];
         require(u.tier != Tier.NONE, "Not a member");
@@ -159,14 +206,15 @@ contract HNTRMembership is IHNTRMembership {
         require(token == usdt || token == usdc, "Unsupported token");
 
         _verifyCommissionAuth(user, uint8(newTier), uplines, ranks, token, deadline, UPGRADE_OP, signature);
+        nonces[user]++;
 
         uint256 priceDiff = tierPrices[newTier] - tierPrices[u.tier];
         Tier oldTier = u.tier;
         u.tier = newTier;
 
-        _processPaymentAndDistribution(user, priceDiff, uplines, ranks, token);
+        uint256 received = _processPaymentAndDistribution(user, priceDiff, uplines, ranks, token);
 
-        emit MembershipUpgraded(user, oldTier, newTier, priceDiff, token);
+        emit MembershipUpgraded(user, oldTier, newTier, received, token);
     }
 
     /// @dev Verifies a company-wallet signature over the commission auth payload.
@@ -183,28 +231,60 @@ contract HNTRMembership is IHNTRMembership {
         require(companyWallet != address(0), "Company wallet not set");
         require(block.timestamp <= deadline, "Signature expired");
         require(uplines.length == ranks.length, "Length mismatch");
+        require(uplines.length <= MAX_UPLINES, "Too many uplines");
+
+        _validateUplines(user, uplines);
 
         for (uint256 i = 0; i < ranks.length; i++) {
             require(ranks[i] <= uint8(Rank.HUNTER), "Invalid rank");
         }
 
-        bytes32 structHash = keccak256(
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(
+            _commissionAuthHash(user, tier, uplines, ranks, token, deadline, operation)
+        );
+        address signer = ECDSA.recover(digest, signature);
+        require(signer == companyWallet, "Invalid signature");
+    }
+
+    /// @dev Arrays are pre-hashed to keep the stack shallow (SEC-01 fields: nonce + epoch).
+    function _commissionAuthHash(
+        address user,
+        uint8 tier,
+        address[] calldata uplines,
+        uint8[] calldata ranks,
+        address token,
+        uint256 deadline,
+        bytes32 operation
+    ) internal view returns (bytes32) {
+        bytes32 uplinesHash = keccak256(abi.encode(uplines));
+        bytes32 ranksHash = keccak256(abi.encode(ranks));
+        return keccak256(
             abi.encode(
                 user,
                 tier,
-                uplines,
-                ranks,
+                uplinesHash,
+                ranksHash,
                 token,
                 deadline,
+                nonces[user],
+                signatureEpoch,
                 block.chainid,
                 address(this),
                 operation
             )
         );
+    }
 
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(structHash);
-        address signer = ECDSA.recover(digest, signature);
-        require(signer == companyWallet, "Invalid signature");
+    /// @dev Reject self-referential, zero, and duplicate uplines (SEC-05).
+    function _validateUplines(address payer, address[] calldata uplines) internal pure {
+        for (uint256 i = 0; i < uplines.length; i++) {
+            address upline = uplines[i];
+            require(upline != address(0), "Zero upline");
+            require(upline != payer, "Self upline");
+            for (uint256 j = 0; j < i; j++) {
+                require(uplines[j] != upline, "Duplicate upline");
+            }
+        }
     }
 
     function _processPaymentAndDistribution(
@@ -213,19 +293,22 @@ contract HNTRMembership is IHNTRMembership {
         address[] calldata uplines,
         uint8[] calldata ranks,
         address token
-    ) internal {
-        // Pull funds from payer
+    ) internal returns (uint256 received) {
+        // Pull funds from payer and distribute only what actually arrived (SEC-04).
+        uint256 beforeBal = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(payer, address(this), amount);
+        received = IERC20(token).balanceOf(address(this)) - beforeBal;
+        require(received > 0, "No tokens received");
 
         {
             // 1. Treasury (25%): 5% base + 20% reallocated from pool wallet
-            IERC20(token).safeTransfer(treasuryWallet, (amount * 25) / 100);
+            IERC20(token).safeTransfer(treasuryWallet, (received * 25) / 100);
 
             // 2. Leadership Pool (5%)
-            IERC20(token).safeTransfer(leadershipWallet, (amount * 5) / 100);
+            IERC20(token).safeTransfer(leadershipWallet, (received * 5) / 100);
 
             // 3. Achievement Bonus (5%)
-            IERC20(token).safeTransfer(achievementWallet, (amount * 5) / 100);
+            IERC20(token).safeTransfer(achievementWallet, (received * 5) / 100);
         }
 
         // 4. Commission Distribution (65% total via Dynamic Compression)
@@ -239,18 +322,17 @@ contract HNTRMembership is IHNTRMembership {
 
             // Skip non-members and anyone who doesn't meet the level's tier + rank gate.
             if (
-                uplineTier != Tier.NONE &&
-                uplineTier >= tierRequiredForLevel[currentLevel - 1] &&
-                uplineRank >= rankRequiredForLevel[currentLevel - 1]
+                uplineTier != Tier.NONE && uplineTier >= tierRequiredForLevel[currentLevel - 1]
+                    && uplineRank >= rankRequiredForLevel[currentLevel - 1]
             ) {
-                // Qualified! Calculate their cut
-                uint256 levelCut = (amount * levelPercentages[currentLevel - 1]) / 100;
+                uint256 levelCut = (received * levelPercentages[currentLevel - 1]) / 100;
                 distributedAmount += levelCut;
 
                 uint256 liquid = (levelCut * 80) / 100;
                 uint256 locked = levelCut - liquid;
 
                 withdrawableCommissions[upline][token] += liquid;
+                totalWithdrawable[token] += liquid;
                 lockedCommissions[upline][token] += locked;
 
                 // Locked value is transferred to the pool wallet
@@ -263,13 +345,13 @@ contract HNTRMembership is IHNTRMembership {
         }
 
         // 5. Breakage (Unpaid commissions go to Treasury)
-        uint256 maxCommission = (amount * 65) / 100;
+        uint256 maxCommission = (received * 65) / 100;
         if (distributedAmount < maxCommission) {
             IERC20(token).safeTransfer(treasuryWallet, maxCommission - distributedAmount);
         }
     }
 
-    function withdrawCommissions(address user, address token) external override {
+    function withdrawCommissions(address user, address token) external override nonReentrant {
         require(msg.sender == user, "Not authorized");
         require(token == usdt || token == usdc, "Unsupported token");
 
@@ -281,7 +363,7 @@ contract HNTRMembership is IHNTRMembership {
 
     /// @notice Allows the company wallet to withdraw claimable commissions on behalf of a user
     /// whose last claim is at least 30 days old. Funds are sent to the user.
-    function withdrawCompanyWallet(address user, address token) external onlyCompanyWallet {
+    function withdrawCompanyWallet(address user, address token) external onlyCompanyWallet nonReentrant {
         require(token == usdt || token == usdc, "Unsupported token");
         require(
             lastClaimedAt[user][token] == 0 || block.timestamp > lastClaimedAt[user][token] + CLAIM_GRACE_PERIOD,
@@ -297,6 +379,7 @@ contract HNTRMembership is IHNTRMembership {
 
     function _withdraw(address user, address token, uint256 amount) internal {
         withdrawableCommissions[user][token] = 0;
+        totalWithdrawable[token] -= amount;
         IERC20(token).safeTransfer(user, amount);
         lastClaimedAt[user][token] = block.timestamp;
         emit CommissionWithdrawn(user, amount, token);
@@ -312,8 +395,9 @@ contract HNTRMembership is IHNTRMembership {
         for (uint256 i = 0; i < allUsers.length; i++) {
             address user = allUsers[i];
             if (
-                withdrawableCommissions[user][token] > 0 &&
-                (lastClaimedAt[user][token] == 0 || block.timestamp > lastClaimedAt[user][token] + CLAIM_GRACE_PERIOD)
+                withdrawableCommissions[user][token] > 0
+                    && (lastClaimedAt[user][token] == 0
+                        || block.timestamp > lastClaimedAt[user][token] + CLAIM_GRACE_PERIOD)
             ) {
                 count++;
             }
@@ -324,8 +408,9 @@ contract HNTRMembership is IHNTRMembership {
         for (uint256 i = 0; i < allUsers.length; i++) {
             address user = allUsers[i];
             if (
-                withdrawableCommissions[user][token] > 0 &&
-                (lastClaimedAt[user][token] == 0 || block.timestamp > lastClaimedAt[user][token] + CLAIM_GRACE_PERIOD)
+                withdrawableCommissions[user][token] > 0
+                    && (lastClaimedAt[user][token] == 0
+                        || block.timestamp > lastClaimedAt[user][token] + CLAIM_GRACE_PERIOD)
             ) {
                 overdue[index++] = user;
             }

@@ -75,6 +75,15 @@ contract DeployHNTRMembership is Script {
         membership.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
         membership.setCompanyWallet(companyWallet);
 
+        // Optional: hand ownership to a Safe multisig (Ownable2Step).
+        // Set OWNER_MULTISIG in the environment; the multisig must then call acceptOwnership().
+        address ownerMultisig = vm.envOr("OWNER_MULTISIG", address(0));
+        if (ownerMultisig != address(0)) {
+            membership.transferOwnership(ownerMultisig);
+            console2.log("Ownership transfer started ->", ownerMultisig);
+            console2.log("Multisig must call acceptOwnership()");
+        }
+
         vm.stopBroadcast();
 
         console2.log("--- Post-deploy configuration ---");
@@ -83,6 +92,7 @@ contract DeployHNTRMembership is Script {
         console2.log("Achievement Wallet:", achievementWallet);
         console2.log("Pool Wallet:       ", poolWallet);
         console2.log("Company Wallet:    ", companyWallet);
+        console2.log("Owner:             ", membership.owner());
 
         // Sanity check: fail loudly if a critical wallet somehow ended up unset.
         require(membership.companyWallet() != address(0), "DEPLOY: companyWallet not configured");

@@ -27,7 +27,7 @@ interface IHNTRMembership {
 
     function getUser(address user) external view returns (User memory);
 
-    // Backend signs (uplines, ranks, deadline). User pays gas and submits the tx.
+    // Backend signs (uplines, ranks, deadline, nonce, signatureEpoch). User pays gas and submits the tx.
     function purchaseMembership(
         address user,
         Tier tier,

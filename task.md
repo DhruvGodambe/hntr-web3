@@ -1,4 +1,4 @@
-# HNTR Protocol Implementation Tasks
+find # HNTR Protocol Implementation Tasks
 
 - `[x]` Phase 1: Core Architecture & Membership
   - `[x]` Initialize Foundry project
