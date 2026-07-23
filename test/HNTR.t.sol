@@ -2,24 +2,12 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {HNTRMembership} from "../src/HNTRMembership.sol";
 import {IHNTRMembership} from "../src/IHNTRMembership.sol";
-import {MockERC20, MockFeeOnTransferERC20} from "./Mocks.sol";
-import {MessageHashUtils} from "openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
-import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
-
-/// @dev 18-decimal token used only to assert constructor decimal guard.
-contract MockERC20_18 is ERC20 {
-    constructor() ERC20("Bad", "BAD") {}
-
-    function decimals() public pure override returns (uint8) {
-        return 18;
-    }
-}
+import {MockERC20, MockERC20_18, MockFeeOnTransferERC20, MockBlacklistERC20} from "./Mocks.sol";
 
 contract HNTRMembershipTest is Test {
-    using MessageHashUtils for bytes32;
-
     MockERC20 usdt;
     MockERC20 usdc;
     HNTRMembership membership;
@@ -110,6 +98,21 @@ contract HNTRMembershipTest is Test {
         ranks[0] = rank;
     }
 
+    bytes32 constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 constant COMMISSION_AUTH_TYPEHASH = keccak256(
+        "CommissionAuth(address user,uint8 tier,bytes32 uplinesHash,bytes32 ranksHash,address token,uint256 deadline,uint256 nonce,uint256 signatureEpoch,bytes32 operation)"
+    );
+
+    /// @dev Mirrors HNTRMembership's EIP712("HNTRMembership", "1") domain separator.
+    function _domainSeparator(address m) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH, keccak256(bytes("HNTRMembership")), keccak256(bytes("1")), block.chainid, m
+            )
+        );
+    }
+
     function _authHash(
         address m,
         address user,
@@ -122,8 +125,9 @@ contract HNTRMembershipTest is Test {
         uint256 epoch,
         bytes32 operation
     ) internal view returns (bytes32) {
-        return keccak256(
+        bytes32 structHash = keccak256(
             abi.encode(
+                COMMISSION_AUTH_TYPEHASH,
                 user,
                 tier,
                 keccak256(abi.encode(uplines)),
@@ -132,11 +136,10 @@ contract HNTRMembershipTest is Test {
                 deadline,
                 nonce,
                 epoch,
-                block.chainid,
-                m,
                 operation
             )
         );
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(m), structHash));
     }
 
     function _signFor(
@@ -149,18 +152,8 @@ contract HNTRMembershipTest is Test {
         uint256 deadline,
         bytes32 operation
     ) internal view returns (bytes memory) {
-        bytes32 digest = _authHash(
-            address(m),
-            user,
-            tier,
-            uplines,
-            ranks,
-            token,
-            deadline,
-            m.nonces(user),
-            m.signatureEpoch(),
-            operation
-        ).toEthSignedMessageHash();
+        bytes32 digest =
+            _authHash(address(m), user, tier, uplines, ranks, token, deadline, m.nonces(user), m.signatureEpoch(), operation);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
         return abi.encodePacked(r, s, v);
     }
@@ -212,8 +205,14 @@ contract HNTRMembershipTest is Test {
     }
 
     function _assertSolvent() internal view {
-        assertGe(usdt.balanceOf(address(membership)), membership.totalWithdrawable(address(usdt)));
-        assertGe(usdc.balanceOf(address(membership)), membership.totalWithdrawable(address(usdc)));
+        assertGe(
+            usdt.balanceOf(address(membership)),
+            membership.totalWithdrawable(address(usdt)) + membership.totalProtocolBalance(address(usdt))
+        );
+        assertGe(
+            usdc.balanceOf(address(membership)),
+            membership.totalWithdrawable(address(usdc)) + membership.totalProtocolBalance(address(usdc))
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -236,15 +235,59 @@ contract HNTRMembershipTest is Test {
         assertEq(sum, 65);
     }
 
-    function test_ConstructorRejectsNon6DecimalTokens() public {
+    function test_ConstructorRejectsMismatchedDecimals() public {
+        // usdt (18-dec) vs usdc (6-dec) — must be rejected regardless of which token is which.
         MockERC20_18 bad = new MockERC20_18();
-        vm.expectRevert("USDT must be 6 decimals");
+        vm.expectRevert("USDT/USDC decimals mismatch");
         new HNTRMembership(address(bad), address(usdc));
     }
 
     function test_ConstructorRejectsZeroToken() public {
         vm.expectRevert("Invalid token");
         new HNTRMembership(address(0), address(usdc));
+    }
+
+    /// @dev Regression test for the Etherscan "0.0000012"-style display bug: deploying
+    /// against a *matching* pair of 18-decimal tokens (e.g. this protocol's actual
+    /// currently-deployed Sepolia USDT/USDC) must succeed and scale tierPrices to 1e18,
+    /// not silently keep assuming 1e6.
+    function test_ConstructorAcceptsMatchingNonSixDecimals() public {
+        MockERC20_18 bigUsdt = new MockERC20_18();
+        MockERC20_18 bigUsdc = new MockERC20_18();
+        HNTRMembership m = new HNTRMembership(address(bigUsdt), address(bigUsdc));
+
+        assertEq(m.tokenDecimals(), 18);
+        assertEq(m.tierPrices(IHNTRMembership.Tier.BRONZE), 50 * 1e18);
+        assertEq(m.tierPrices(IHNTRMembership.Tier.DIAMOND), 2500 * 1e18);
+    }
+
+    /// @dev End-to-end proof that a purchase against 18-decimal tokens moves a properly
+    /// dollar-scaled amount, not a near-zero fraction of a cent.
+    function test_Deploy18DecimalTokensScalesPricesCorrectly() public {
+        MockERC20_18 bigUsdt = new MockERC20_18();
+        MockERC20_18 bigUsdc = new MockERC20_18();
+        HNTRMembership m = new HNTRMembership(address(bigUsdt), address(bigUsdc));
+        m.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
+        m.setCompanyWallet(companySigner);
+
+        address buyer = makeAddr("bigDecBuyer");
+        bigUsdt.mint(buyer, 1_000 * 1e18);
+        vm.prank(buyer);
+        bigUsdt.approve(address(m), type(uint256).max);
+
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig = _signFor(
+            m, buyer, uint8(IHNTRMembership.Tier.BRONZE), _emptyAddrs(), _emptyRanks(), address(bigUsdt), deadline, PURCHASE_OP
+        );
+        vm.prank(buyer);
+        m.purchaseMembership(
+            buyer, IHNTRMembership.Tier.BRONZE, _emptyAddrs(), _emptyRanks(), address(bigUsdt), deadline, sig
+        );
+
+        // $50 in 18-decimal units — previously this would have pulled 50 * 1e6 wei, i.e.
+        // 0.00000000005 tokens, the exact bug reported on Etherscan.
+        assertEq(bigUsdt.balanceOf(buyer), 1_000 * 1e18 - 50 * 1e18);
+        assertEq(uint8(m.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -546,9 +589,17 @@ contract HNTRMembershipTest is Test {
     function test_CompanyWalletSweepSendsToUser() public {
         uint256 amount = membership.withdrawableCommissions(user1, address(usdt));
         assertGt(amount, 0);
-        // never claimed → overdue immediately (lastClaimedAt == 0)
-        uint256 bal0 = usdt.balanceOf(user1);
 
+        // Appendix A #2 fix: a wallet that has never explicitly claimed still gets the
+        // full 30-day grace period starting from when it *first earned* — it is no longer
+        // immediately sweepable just because lastClaimedAt happens to read 0.
+        vm.prank(companySigner);
+        vm.expectRevert("Claim not overdue");
+        membership.withdrawCompanyWallet(user1, address(usdt));
+
+        vm.warp(block.timestamp + 30 days + 1);
+
+        uint256 bal0 = usdt.balanceOf(user1);
         vm.prank(companySigner);
         membership.withdrawCompanyWallet(user1, address(usdt));
 
@@ -588,6 +639,12 @@ contract HNTRMembershipTest is Test {
     }
 
     function test_GetOverdueWallets() public {
+        // Nobody is overdue right after setUp — earners now get a full grace period
+        // from when they first earned (Appendix A #2 fix).
+        vm.prank(companySigner);
+        assertEq(membership.getOverdueWallets(address(usdt)).length, 0);
+
+        vm.warp(block.timestamp + 30 days + 1);
         vm.prank(companySigner);
         address[] memory overdue = membership.getOverdueWallets(address(usdt));
         assertGt(overdue.length, 0);
@@ -624,7 +681,7 @@ contract HNTRMembershipTest is Test {
             0,
             membership.signatureEpoch(),
             UPGRADE_OP
-        ).toEthSignedMessageHash();
+        );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(companyPk, digest);
 
         vm.prank(buyer);
@@ -683,8 +740,8 @@ contract HNTRMembershipTest is Test {
             0,
             0,
             PURCHASE_OP
-        ).toEthSignedMessageHash();
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xB0B, digest); // not company key
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xB0B, digest); // not an authorized signer
 
         vm.prank(buyer);
         vm.expectRevert("Invalid signature");
@@ -814,7 +871,9 @@ contract HNTRMembershipTest is Test {
     }
 
     function test_RescueRespectsLiabilities() public {
-        uint256 liability = membership.totalWithdrawable(address(usdt));
+        // Liability floor now also covers uncollected protocol-wallet balances
+        // (treasury/leadership/achievement/pool), not just member commissions.
+        uint256 liability = membership.totalWithdrawable(address(usdt)) + membership.totalProtocolBalance(address(usdt));
         uint256 bal = usdt.balanceOf(address(membership));
         assertGe(bal, liability);
 
@@ -986,5 +1045,286 @@ contract HNTRMembershipTest is Test {
         (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
         _purchase(buyer, IHNTRMembership.Tier.GOLD, up, ranks);
         _assertSolvent();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-01 residual: multi-signer registry + deadline ceiling
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_AdditionalAuthorizedSignerCanSign() public {
+        uint256 secondPk = 0xC0FFEE;
+        address secondSigner = vm.addr(secondPk);
+
+        address buyer = makeAddr("multiSigBuyer");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + 600;
+
+        // Not yet authorized -> rejected
+        bytes32 digest = _authHash(
+            address(membership),
+            buyer,
+            uint8(IHNTRMembership.Tier.BRONZE),
+            up,
+            ranks,
+            address(usdt),
+            deadline,
+            0,
+            0,
+            PURCHASE_OP
+        );
+        {
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(secondPk, digest);
+            vm.prank(buyer);
+            vm.expectRevert("Invalid signature");
+            membership.purchaseMembership(
+                buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, abi.encodePacked(r, s, v)
+            );
+        }
+
+        membership.authorizeSigner(secondSigner);
+        assertTrue(membership.isAuthorizedSigner(secondSigner));
+
+        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(secondPk, digest);
+        vm.prank(buyer);
+        membership.purchaseMembership(
+            buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, abi.encodePacked(r2, s2, v2)
+        );
+        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
+
+        // Revoking blocks further use, without touching companyWallet's own authority.
+        membership.revokeSigner(secondSigner);
+        assertFalse(membership.isAuthorizedSigner(secondSigner));
+        assertTrue(membership.isAuthorizedSigner(companySigner));
+    }
+
+    function test_OnlyOwnerManagesSigners() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        membership.authorizeSigner(user1);
+
+        vm.prank(user1);
+        vm.expectRevert();
+        membership.revokeSigner(companySigner);
+    }
+
+    function test_DeadlineTooFarReverts() public {
+        address buyer = makeAddr("farDeadline");
+        _fundAndApprove(buyer);
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 deadline = block.timestamp + membership.MAX_SIGNATURE_VALIDITY() + 1;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+        vm.prank(buyer);
+        vm.expectRevert("Deadline too far");
+        membership.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Section 5.1: renounceOwnership disabled
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_RenounceOwnershipDisabled() public {
+        vm.expectRevert("Renounce disabled");
+        membership.renounceOwnership();
+        assertEq(membership.owner(), address(this));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Permit-based single-transaction purchase / upgrade
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function _signPermit(uint256 ownerPk, MockERC20 token, address spender, uint256 value, uint256 permitDeadline)
+        internal
+        view
+        returns (uint8 v, bytes32 r, bytes32 s)
+    {
+        address ownerAddr = vm.addr(ownerPk);
+        bytes32 PERMIT_TYPEHASH =
+            keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+        bytes32 structHash = keccak256(
+            abi.encode(PERMIT_TYPEHASH, ownerAddr, spender, value, token.nonces(ownerAddr), permitDeadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", token.DOMAIN_SEPARATOR(), structHash));
+        (v, r, s) = vm.sign(ownerPk, digest);
+    }
+
+    function test_PurchaseWithPermitSingleTransaction() public {
+        uint256 buyerPk = 0xBEEF;
+        address buyer = vm.addr(buyerPk);
+        usdt.mint(buyer, 1_000 * 1e6);
+        // Deliberately no approve() call — permit is the only authorization for the pull.
+        assertEq(usdt.allowance(buyer, address(membership)), 0);
+
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        uint256 price = membership.tierPrices(IHNTRMembership.Tier.BRONZE);
+        uint256 permitDeadline = block.timestamp + 600;
+        (uint8 pv, bytes32 pr, bytes32 ps) = _signPermit(buyerPk, usdt, address(membership), price, permitDeadline);
+
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.BRONZE), up, ranks, address(usdt), deadline, PURCHASE_OP);
+
+        vm.prank(buyer);
+        membership.purchaseMembershipWithPermit(
+            buyer, IHNTRMembership.Tier.BRONZE, up, ranks, address(usdt), deadline, sig, price, permitDeadline, pv, pr, ps
+        );
+
+        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
+        assertEq(usdt.balanceOf(buyer), 1_000 * 1e6 - price);
+        _assertSolvent();
+    }
+
+    function test_UpgradeWithPermitSingleTransaction() public {
+        uint256 buyerPk = 0xFEED;
+        address buyer = vm.addr(buyerPk);
+        usdt.mint(buyer, 1_000 * 1e6);
+        vm.prank(buyer);
+        usdt.approve(address(membership), type(uint256).max);
+
+        (address[] memory up, uint8[] memory ranks) = _oneUpline(rootUser, HUNTER);
+        _purchase(buyer, IHNTRMembership.Tier.BRONZE, up, ranks);
+
+        // Drop the allowance back to zero to prove the upgrade only succeeds via permit.
+        vm.prank(buyer);
+        usdt.approve(address(membership), 0);
+
+        uint256 priceDiff = membership.tierPrices(IHNTRMembership.Tier.SILVER) - membership.tierPrices(IHNTRMembership.Tier.BRONZE);
+        uint256 permitDeadline = block.timestamp + 600;
+        (uint8 pv, bytes32 pr, bytes32 ps) = _signPermit(buyerPk, usdt, address(membership), priceDiff, permitDeadline);
+
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig =
+            _signAuth(buyer, uint8(IHNTRMembership.Tier.SILVER), up, ranks, address(usdt), deadline, UPGRADE_OP);
+
+        vm.prank(buyer);
+        membership.upgradeMembershipWithPermit(
+            buyer,
+            IHNTRMembership.Tier.SILVER,
+            up,
+            ranks,
+            address(usdt),
+            deadline,
+            sig,
+            priceDiff,
+            permitDeadline,
+            pv,
+            pr,
+            ps
+        );
+
+        assertEq(uint8(membership.getUser(buyer).tier), uint8(IHNTRMembership.Tier.SILVER));
+        _assertSolvent();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SEC-04 residual: pull-payment protocol balances
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_WithdrawProtocolBalance() public {
+        // Try-push delivers funds directly in the normal case, so protocolBalances
+        // only accrues when a transfer fails.  Use a blacklist token to force fallback.
+        MockBlacklistERC20 blToken = new MockBlacklistERC20();
+        HNTRMembership m = new HNTRMembership(address(blToken), address(blToken));
+        m.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
+        m.setCompanyWallet(companySigner);
+
+        blToken.setBlacklisted(treasuryWallet, true);
+
+        address buyer = makeAddr("protocolWithdrawBuyer");
+        blToken.mint(buyer, 1_000 * 1e6);
+        vm.prank(buyer);
+        blToken.approve(address(m), type(uint256).max);
+
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig = _signFor(
+            m, buyer, uint8(IHNTRMembership.Tier.BRONZE), _emptyAddrs(), _emptyRanks(), address(blToken), deadline, PURCHASE_OP
+        );
+        vm.prank(buyer);
+        m.purchaseMembership(buyer, IHNTRMembership.Tier.BRONZE, _emptyAddrs(), _emptyRanks(), address(blToken), deadline, sig);
+
+        uint256 owed = m.protocolBalances(treasuryWallet, address(blToken));
+        assertGt(owed, 0);
+
+        blToken.setBlacklisted(treasuryWallet, false);
+        vm.prank(treasuryWallet);
+        m.withdrawProtocolBalance(address(blToken));
+
+        assertEq(blToken.balanceOf(treasuryWallet), owed);
+        assertEq(m.protocolBalances(treasuryWallet, address(blToken)), 0);
+    }
+
+    function test_WithdrawProtocolBalanceNothingOwedReverts() public {
+        vm.prank(user1);
+        vm.expectRevert("No balance to withdraw");
+        membership.withdrawProtocolBalance(address(usdt));
+    }
+
+    /// @dev Direct regression test for the SEC-04 residual finding: a frozen/blacklisted
+    /// protocol wallet must no longer be able to halt purchases. Deploys a fresh contract
+    /// against a blacklist-capable token, freezes treasuryWallet, and asserts the purchase
+    /// still succeeds — its share simply accrues, ready to withdraw once unfrozen.
+    function test_BlacklistedProtocolWalletDoesNotBlockPurchase() public {
+        MockBlacklistERC20 blToken = new MockBlacklistERC20();
+        HNTRMembership m = new HNTRMembership(address(blToken), address(blToken));
+        m.setWallets(treasuryWallet, leadershipWallet, achievementWallet, poolWallet);
+        m.setCompanyWallet(companySigner);
+
+        blToken.setBlacklisted(treasuryWallet, true);
+
+        address buyer = makeAddr("blacklistBuyer");
+        blToken.mint(buyer, 1_000 * 1e6);
+        vm.prank(buyer);
+        blToken.approve(address(m), type(uint256).max);
+
+        uint256 deadline = block.timestamp + 600;
+        bytes memory sig = _signFor(
+            m, buyer, uint8(IHNTRMembership.Tier.BRONZE), _emptyAddrs(), _emptyRanks(), address(blToken), deadline, PURCHASE_OP
+        );
+
+        vm.prank(buyer);
+        m.purchaseMembership(
+            buyer, IHNTRMembership.Tier.BRONZE, _emptyAddrs(), _emptyRanks(), address(blToken), deadline, sig
+        );
+
+        assertEq(uint8(m.getUser(buyer).tier), uint8(IHNTRMembership.Tier.BRONZE));
+        uint256 owed = m.protocolBalances(treasuryWallet, address(blToken));
+        assertGt(owed, 0);
+
+        // Still frozen -> withdraw itself reverts, but the purchase path never touched it.
+        vm.prank(treasuryWallet);
+        vm.expectRevert("Blacklisted recipient");
+        m.withdrawProtocolBalance(address(blToken));
+
+        blToken.setBlacklisted(treasuryWallet, false);
+        vm.prank(treasuryWallet);
+        m.withdrawProtocolBalance(address(blToken));
+        assertEq(blToken.balanceOf(treasuryWallet), owed);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Appendix A #10: no more double-emit on company-wallet sweep
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_CompanyWalletSweepEmitsOnlyOneEvent() public {
+        vm.warp(block.timestamp + 30 days + 1);
+
+        vm.recordLogs();
+        vm.prank(companySigner);
+        membership.withdrawCompanyWallet(user1, address(usdt));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint256 commissionWithdrawnCount;
+        uint256 companyWalletWithdrawnCount;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == keccak256("CommissionWithdrawn(address,uint256,address)")) {
+                commissionWithdrawnCount++;
+            }
+            if (logs[i].topics[0] == keccak256("CompanyWalletWithdrawn(address,address,uint256,address)")) {
+                companyWalletWithdrawnCount++;
+            }
+        }
+        assertEq(commissionWithdrawnCount, 0);
+        assertEq(companyWalletWithdrawnCount, 1);
     }
 }
