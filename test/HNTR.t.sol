@@ -479,12 +479,12 @@ contract HNTRMembershipTest is Test {
         _assertSolvent();
     }
 
-    function test_DynamicCompressionSkipsUnqualified() public {
-        // Bronze member with rank NONE cannot earn L4 (needs Bronze+Scout).
-        // Place them first; L4 should compress to the next qualified Diamond/Hunter.
+    function test_UnqualifiedLevelForfeitsNoCompression() public {
+        // Bronze + rank NONE cannot earn L4 (needs Bronze+Scout).
+        // Fixed position: L4 forfeits to treasury; deep stays at L5 (does not slide into L4).
         address bronze = makeAddr("bronzeGate");
         address deep = makeAddr("deepLeader");
-        address buyer = makeAddr("compressBuyer");
+        address buyer = makeAddr("forfeitBuyer");
         _fundAndApprove(bronze);
         _fundAndApprove(deep);
         _fundAndApprove(buyer);
@@ -495,8 +495,6 @@ contract HNTRMembershipTest is Test {
             _purchase(bronze, IHNTRMembership.Tier.BRONZE, upB, ranksB);
         }
 
-        // Build 4 uplines: 3 Diamond/Hunter then bronze with NONE rank for L4 slot attempt.
-        // Compression: L1-L3 go to first three Diamond; L4 skips bronze (rank NONE < SCOUT), goes to deep.
         address a = makeAddr("a");
         address b = makeAddr("b");
         address c = makeAddr("c");
@@ -522,8 +520,8 @@ contract HNTRMembershipTest is Test {
         uplines[0] = c;
         uplines[1] = b;
         uplines[2] = a;
-        uplines[3] = bronze; // unqualified for L4
-        uplines[4] = deep; // should get L4
+        uplines[3] = bronze; // unqualified for L4 → forfeit
+        uplines[4] = deep; // evaluated at L5 only
         uint8[] memory ranks = new uint8[](5);
         ranks[0] = HUNTER;
         ranks[1] = HUNTER;
@@ -533,13 +531,19 @@ contract HNTRMembershipTest is Test {
 
         uint256 deepLiq0 = membership.withdrawableCommissions(deep, address(usdt));
         uint256 bronzeLiq0 = membership.withdrawableCommissions(bronze, address(usdt));
+        uint256 t0 = usdt.balanceOf(treasuryWallet);
+        uint256 price = 2500 * 1e6;
 
         _purchase(buyer, IHNTRMembership.Tier.DIAMOND, uplines, ranks);
 
-        // L4 = 5% of 2500 = 125; liquid 80% = 100 → deep
-        assertEq(membership.withdrawableCommissions(deep, address(usdt)) - deepLiq0, 100 * 1e6);
-        // bronze should not have gained from this sale's L4
+        // L5 = 4% of 2500 = 100; liquid 80% = 80 → deep (not L4's 5%)
+        assertEq(membership.withdrawableCommissions(deep, address(usdt)) - deepLiq0, 80 * 1e6);
+        // bronze must not receive L4
         assertEq(membership.withdrawableCommissions(bronze, address(usdt)), bronzeLiq0);
+
+        // Paid: L1 15 + L2 15 + L3 8 + L5 4 = 42%. Breakage of 65% pool = 23%.
+        // Treasury: base 25% + breakage 23% = 48%.
+        assertEq(usdt.balanceOf(treasuryWallet) - t0, (price * 48) / 100);
         _assertSolvent();
     }
 

@@ -449,19 +449,22 @@ contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGu
         _creditProtocol(leadershipWallet, token, (received * 5) / 100);
         _creditProtocol(achievementWallet, token, (received * 5) / 100);
 
+        // Fixed-position unilevel: uplines[i] is always evaluated at level i+1.
+        // Unqualified levels forfeit their cut (breakage → treasury). No compression.
         uint256 distributedAmount = 0;
-        uint8 currentLevel = 1;
+        uint256 levels = uplines.length < 12 ? uplines.length : 12;
 
-        for (uint256 i = 0; i < uplines.length && currentLevel <= 12; i++) {
+        for (uint256 i = 0; i < levels; i++) {
+            uint8 currentLevel = uint8(i + 1);
             address upline = uplines[i];
             Tier uplineTier = users[upline].tier;
             Rank uplineRank = Rank(ranks[i]);
 
             if (
-                uplineTier != Tier.NONE && uplineTier >= tierRequiredForLevel[currentLevel - 1]
-                    && uplineRank >= rankRequiredForLevel[currentLevel - 1]
+                uplineTier != Tier.NONE && uplineTier >= tierRequiredForLevel[i]
+                    && uplineRank >= rankRequiredForLevel[i]
             ) {
-                uint256 levelCut = (received * levelPercentages[currentLevel - 1]) / 100;
+                uint256 levelCut = (received * levelPercentages[i]) / 100;
                 distributedAmount += levelCut;
 
                 uint256 liquid = (levelCut * 80) / 100;
@@ -473,8 +476,6 @@ contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGu
                 _creditProtocol(poolWallet, token, locked);
 
                 emit CommissionEarned(upline, liquid, locked, currentLevel, token);
-
-                currentLevel++;
             }
         }
 
