@@ -75,18 +75,21 @@ contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGu
     Tier[12] public tierRequiredForLevel = [
         Tier.NONE, Tier.NONE, Tier.NONE,
         Tier.BRONZE, Tier.SILVER, Tier.SILVER,
-        Tier.GOLD, Tier.GOLD, Tier.GOLD, Tier.GOLD,
-        Tier.PLATINUM, Tier.PLATINUM
+        Tier.GOLD, Tier.GOLD, Tier.GOLD,
+        Tier.PLATINUM, Tier.PLATINUM, Tier.PLATINUM
     ];
 
     Rank[12] public rankRequiredForLevel = [
         Rank.NONE, Rank.NONE, Rank.NONE,
         Rank.SCOUT, Rank.TRACKER, Rank.TRACKER,
-        Rank.RANGER, Rank.RANGER, Rank.RANGER, Rank.RANGER,
-        Rank.HUNTER, Rank.HUNTER
+        Rank.RANGER, Rank.RANGER, Rank.RANGER,
+        Rank.HUNTER, Rank.HUNTER, Rank.HUNTER
     ];
 
     uint256 public constant CLAIM_GRACE_PERIOD = 30 days;
+
+    /// @dev One-shot migration gate. After sealBootstrap(), seed/fund bootstrap calls revert.
+    bool public bootstrapClosed;
 
     /// @dev EIP-712 typed struct. Dynamic arrays (uplines/ranks) are pre-hashed into the
     /// struct as bytes32 fields so scalar fields remain visible to a hardware-wallet signer.
@@ -107,9 +110,20 @@ contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGu
     event SignerRevoked(address indexed signer);
     event ProtocolFundsCredited(address indexed wallet, address indexed token, uint256 amount);
     event ProtocolFundsWithdrawn(address indexed wallet, address indexed token, uint256 amount);
+    event BootstrapFunded(address indexed token, uint256 amount, uint256 newBalance);
+    event MembershipSeeded(address indexed user, Tier tier, uint256 joinedAt);
+    event CommissionSeeded(
+        address indexed user, address indexed token, uint256 withdrawable, uint256 locked, uint256 lastClaimed
+    );
+    event BootstrapSealed();
 
     modifier onlyCompanyWallet() {
         require(msg.sender == companyWallet, "Not company wallet");
+        _;
+    }
+
+    modifier onlyBootstrapOpen() {
+        require(!bootstrapClosed, "Bootstrap closed");
         _;
     }
 
@@ -199,6 +213,96 @@ contract HNTRMembership is IHNTRMembership, Ownable2Step, Pausable, ReentrancyGu
 
         IERC20(token).safeTransfer(to, amount);
         emit TokensRescued(token, to, amount);
+    }
+
+    /// @notice Stage 1 — owner pulls USDT/USDC into the contract to cover future claim liabilities.
+    /// Amount should equal (or exceed) the sum of withdrawable commissions that stage 2 will seed.
+    function fundBootstrap(address token, uint256 amount) external onlyOwner onlyBootstrapOpen nonReentrant {
+        require(token == usdt || token == usdc, "Unsupported token");
+        require(amount > 0, "Zero amount");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        emit BootstrapFunded(token, amount, IERC20(token).balanceOf(address(this)));
+    }
+
+    /// @notice Stage 2a — restore memberships from an off-chain snapshot (Mongo / old contract).
+    /// Does not emit MembershipPurchased (avoids listener volume double-counting).
+    function seedMemberships(address[] calldata accounts, Tier[] calldata tiers, uint256[] calldata joinedAts)
+        external
+        onlyOwner
+        onlyBootstrapOpen
+    {
+        uint256 len = accounts.length;
+        require(len == tiers.length && len == joinedAts.length, "Length mismatch");
+
+        for (uint256 i = 0; i < len; i++) {
+            address account = accounts[i];
+            Tier tier = tiers[i];
+            require(account != address(0), "Zero account");
+            require(tier != Tier.NONE, "Invalid tier");
+            require(users[account].tier == Tier.NONE, "Already a member");
+
+            users[account] = User({tier: tier, joinedAt: joinedAts[i]});
+            allUsers.push(account);
+            emit MembershipSeeded(account, tier, joinedAts[i]);
+        }
+    }
+
+    /// @notice Stage 2b — restore claimable/locked commission balances (additive for batching).
+    /// Does not emit CommissionEarned. Does not re-push locked share to poolWallet.
+    function seedCommissions(
+        address[] calldata accounts,
+        address[] calldata tokens,
+        uint256[] calldata withdrawable,
+        uint256[] calldata locked,
+        uint256[] calldata lastClaimed
+    ) external onlyOwner onlyBootstrapOpen {
+        uint256 len = accounts.length;
+        require(
+            len == tokens.length && len == withdrawable.length && len == locked.length && len == lastClaimed.length,
+            "Length mismatch"
+        );
+
+        for (uint256 i = 0; i < len; i++) {
+            address account = accounts[i];
+            address token = tokens[i];
+            require(account != address(0), "Zero account");
+            require(token == usdt || token == usdc, "Unsupported token");
+
+            uint256 liquid = withdrawable[i];
+            uint256 lockAmt = locked[i];
+            if (liquid == 0 && lockAmt == 0 && lastClaimed[i] == 0) continue;
+
+            if (liquid > 0) {
+                withdrawableCommissions[account][token] += liquid;
+                totalWithdrawable[token] += liquid;
+            }
+            if (lockAmt > 0) {
+                lockedCommissions[account][token] += lockAmt;
+            }
+            if (lastClaimed[i] != 0 && lastClaimedAt[account][token] == 0) {
+                lastClaimedAt[account][token] = lastClaimed[i];
+            } else if (liquid > 0 && lastClaimedAt[account][token] == 0) {
+                lastClaimedAt[account][token] = block.timestamp;
+            }
+
+            emit CommissionSeeded(account, token, liquid, lockAmt, lastClaimedAt[account][token]);
+        }
+    }
+
+    /// @notice Close bootstrap permanently. Requires contract token balances cover liabilities.
+    function sealBootstrap() external onlyOwner onlyBootstrapOpen {
+        require(fundingShortfall(usdt) == 0, "USDT underfunded");
+        require(fundingShortfall(usdc) == 0, "USDC underfunded");
+        bootstrapClosed = true;
+        emit BootstrapSealed();
+    }
+
+    /// @notice How much more of `token` the contract needs so balance covers withdrawable + protocol liabilities.
+    function fundingShortfall(address token) public view returns (uint256) {
+        require(token == usdt || token == usdc, "Unsupported token");
+        uint256 needed = totalWithdrawable[token] + totalProtocolBalance[token];
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        return bal >= needed ? 0 : needed - bal;
     }
 
     function getUser(address user) external view override returns (User memory) {

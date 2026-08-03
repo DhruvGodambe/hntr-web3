@@ -97,4 +97,20 @@ interface IHNTRMembership {
     function setWallets(address _treasury, address _leadership, address _achievement, address _poolWallet) external;
     function setCompanyWallet(address _companyWallet) external;
     function rescueToken(address token, address to, uint256 amount) external;
+
+    // --- Bootstrap after redeploy (owner-only, seal when done) -------------------------
+    // Stage 1: fund claim liabilities. Stage 2: seed memberships + commission mappings.
+    function fundBootstrap(address token, uint256 amount) external;
+    function seedMemberships(address[] calldata accounts, Tier[] calldata tiers, uint256[] calldata joinedAts)
+        external;
+    function seedCommissions(
+        address[] calldata accounts,
+        address[] calldata tokens,
+        uint256[] calldata withdrawable,
+        uint256[] calldata locked,
+        uint256[] calldata lastClaimed
+    ) external;
+    function sealBootstrap() external;
+    function bootstrapClosed() external view returns (bool);
+    function fundingShortfall(address token) external view returns (uint256);
 }
